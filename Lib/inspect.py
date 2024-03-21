@@ -1311,8 +1311,8 @@ def getsourcelines(object):
         (isframe(object) and object.f_code.co_name == "<module>")):
         return lines, 0
     lines = lines[lnum: end_lnum + 1]
-    lines[0] = lines[0][col_offset:]
     lines[-1] = lines[-1][:end_col_offset]
+    lines[0] = lines[0][col_offset:]
     return lines, lnum + 1
 
 def getsource(object):
