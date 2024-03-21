@@ -923,6 +923,8 @@ def getfile(object):
         object = object.tb_frame
     if isframe(object):
         object = object.f_code
+    if isgenerator(object):
+        object = object.gi_code
     if iscode(object):
         return object.co_filename
     raise TypeError('module, class, method, function, traceback, frame, or '
@@ -1107,7 +1109,7 @@ class _ClassFinder(ast.NodeVisitor):
             return self.lineno_found[-1][0]
 
 
-def findsource(object):
+def findsource(object, precise_position=False):
     """Return the entire source file and starting line number for an object.
 
     The argument may be a module, class, method, function, traceback, frame,
@@ -1153,20 +1155,21 @@ def findsource(object):
         object = object.tb_frame
     if isframe(object):
         object = object.f_code
+    if isgenerator(object):
+        object = object.gi_code
     if iscode(object):
-        if not hasattr(object, 'co_firstlineno'):
+        if not hasattr(object, 'co_positions'):
             raise OSError('could not find function definition')
-        lnum = object.co_firstlineno - 1
-        pat = re.compile(r'^(\s*def\s)|(\s*async\s+def\s)|(.*(?<!\w)lambda(:|\s))|^(\s*@)')
-        while lnum > 0:
-            try:
-                line = lines[lnum]
-            except IndexError:
-                raise OSError('lineno is out of bounds')
-            if pat.match(line):
-                break
-            lnum = lnum - 1
-        return lines, lnum
+        for lineno, end_lineno, col_offset, end_col_offset in object.co_positions():
+            if None not in (lineno, end_lineno, col_offset, end_col_offset):
+                lnum = lineno - 1
+                if precise_position:
+                    # keep indentation for function and class definitions
+                    if re.match(r'\s+(?:(?:async\s+)?def|class|@)\b', lines[lnum]):
+                        col_offset = 0
+                    return lines, lnum, end_lineno - 1, col_offset, end_col_offset
+                else:
+                    return lines, lnum
     raise OSError('could not find code object')
 
 def getcomments(object):
@@ -1298,7 +1301,7 @@ def getsourcelines(object):
     original source file the first line of code was found.  An OSError is
     raised if the source code cannot be retrieved."""
     object = unwrap(object)
-    lines, lnum = findsource(object)
+    lines, lnum, end_lnum, col_offset, end_col_offset = findsource(object, precise_position=True)
 
     if istraceback(object):
         object = object.tb_frame
@@ -1307,8 +1310,10 @@ def getsourcelines(object):
     if (ismodule(object) or
         (isframe(object) and object.f_code.co_name == "<module>")):
         return lines, 0
-    else:
-        return getblock(lines[lnum:]), lnum + 1
+    lines = lines[lnum: end_lnum + 1]
+    lines[0] = lines[0][col_offset:]
+    lines[-1] = lines[-1][:end_col_offset]
+    return lines, lnum + 1
 
 def getsource(object):
     """Return the text of the source code for an object.

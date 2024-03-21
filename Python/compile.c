@@ -1256,9 +1256,10 @@ codegen_addop_j(instr_sequence *seq, location loc,
 
 static int
 compiler_enter_scope(struct compiler *c, identifier name,
-                     int scope_type, void *key, int lineno)
+                     int scope_type, void *key, int lineno, int end_lineno,
+                     int col_offset, int end_col_offset)
 {
-    location loc = LOCATION(lineno, lineno, 0, 0);
+    location loc = LOCATION(lineno, end_lineno, col_offset, end_col_offset);
 
     struct compiler_unit *u;
 
@@ -1766,7 +1767,7 @@ compiler_enter_anonymous_scope(struct compiler* c, mod_ty mod)
     _Py_DECLARE_STR(anon_module, "<module>");
     RETURN_IF_ERROR(
         compiler_enter_scope(c, &_Py_STR(anon_module), COMPILER_SCOPE_MODULE,
-                             mod, 1));
+                             mod, 1, 1, 0, 0));
     return SUCCESS;
 }
 
@@ -2196,7 +2197,8 @@ compiler_type_params(struct compiler *c, asdl_type_param_seq *type_params)
             if (typeparam->v.TypeVar.bound) {
                 expr_ty bound = typeparam->v.TypeVar.bound;
                 if (compiler_enter_scope(c, typeparam->v.TypeVar.name, COMPILER_SCOPE_TYPEPARAMS,
-                                        (void *)typeparam, bound->lineno) == -1) {
+                        (void *)typeparam, bound->lineno, bound->end_lineno, bound->col_offset,
+                        bound->end_col_offset) == -1) {
                     return ERROR;
                 }
                 VISIT_IN_SCOPE(c, expr, bound);
@@ -2269,7 +2271,8 @@ compiler_function_body(struct compiler *c, stmt_ty s, int is_async, Py_ssize_t f
     }
 
     RETURN_IF_ERROR(
-        compiler_enter_scope(c, name, scope_type, (void *)s, firstlineno));
+        compiler_enter_scope(c, name, scope_type, (void *)s, firstlineno, s->end_lineno,
+                             s->col_offset, s->end_col_offset));
 
     Py_ssize_t first_instr = 0;
     PyObject *docstring = _PyAST_GetDocString(body);
@@ -2331,7 +2334,9 @@ compiler_function(struct compiler *c, stmt_ty s, int is_async)
     asdl_type_param_seq *type_params;
     Py_ssize_t funcflags;
     int annotations;
+    expr_ty first_deco;
     int firstlineno;
+    int firstcol_offset;
 
     if (is_async) {
         assert(s->kind == AsyncFunctionDef_kind);
@@ -2355,8 +2360,11 @@ compiler_function(struct compiler *c, stmt_ty s, int is_async)
     RETURN_IF_ERROR(compiler_decorators(c, decos));
 
     firstlineno = s->lineno;
+    firstcol_offset = s->col_offset;
     if (asdl_seq_LEN(decos)) {
-        firstlineno = ((expr_ty)asdl_seq_GET(decos, 0))->lineno;
+        first_deco = (expr_ty)asdl_seq_GET(decos, 0);
+        firstlineno = first_deco->lineno;
+        firstcol_offset = first_deco->col_offset;
     }
 
     location loc = LOC(s);
@@ -2385,7 +2393,8 @@ compiler_function(struct compiler *c, stmt_ty s, int is_async)
             return ERROR;
         }
         if (compiler_enter_scope(c, type_params_name, COMPILER_SCOPE_TYPEPARAMS,
-                                 (void *)type_params, firstlineno) == -1) {
+                                 (void *)type_params, firstlineno, s->end_lineno,
+                                 firstcol_offset, s->end_col_offset) == -1) {
             Py_DECREF(type_params_name);
             return ERROR;
         }
@@ -2471,7 +2480,8 @@ compiler_class_body(struct compiler *c, stmt_ty s, int firstlineno)
     /* 1. compile the class body into a code object */
     RETURN_IF_ERROR(
         compiler_enter_scope(c, s->v.ClassDef.name,
-                             COMPILER_SCOPE_CLASS, (void *)s, firstlineno));
+                             COMPILER_SCOPE_CLASS, (void *)s, firstlineno,
+                             s->end_lineno, s->col_offset, s->end_col_offset));
 
     location loc = LOCATION(firstlineno, firstlineno, 0, 0);
     /* use the class name for name mangling */
@@ -2589,9 +2599,13 @@ compiler_class(struct compiler *c, stmt_ty s)
 
     RETURN_IF_ERROR(compiler_decorators(c, decos));
 
+    expr_ty first_deco;
     int firstlineno = s->lineno;
+    int firstcol_offset = s->col_offset;
     if (asdl_seq_LEN(decos)) {
-        firstlineno = ((expr_ty)asdl_seq_GET(decos, 0))->lineno;
+        first_deco = (expr_ty)asdl_seq_GET(decos, 0);
+        firstlineno = first_deco->lineno;
+        firstcol_offset = first_deco->col_offset;
     }
     location loc = LOC(s);
 
@@ -2605,7 +2619,8 @@ compiler_class(struct compiler *c, stmt_ty s)
             return ERROR;
         }
         if (compiler_enter_scope(c, type_params_name, COMPILER_SCOPE_TYPEPARAMS,
-                                 (void *)type_params, firstlineno) == -1) {
+                                 (void *)type_params, firstlineno, s->end_lineno,
+                                 firstcol_offset, s->end_col_offset) == -1) {
             Py_DECREF(type_params_name);
             return ERROR;
         }
@@ -2688,7 +2703,8 @@ compiler_typealias_body(struct compiler *c, stmt_ty s)
     location loc = LOC(s);
     PyObject *name = s->v.TypeAlias.name->v.Name.id;
     RETURN_IF_ERROR(
-        compiler_enter_scope(c, name, COMPILER_SCOPE_FUNCTION, s, loc.lineno));
+        compiler_enter_scope(c, name, COMPILER_SCOPE_FUNCTION, s, loc.lineno,
+                             loc.end_lineno, loc.col_offset, loc.end_col_offset));
     /* Make None the first constant, so the evaluate function can't have a
         docstring. */
     RETURN_IF_ERROR(compiler_add_const(c->c_const_cache, c->u, Py_None));
@@ -2723,7 +2739,8 @@ compiler_typealias(struct compiler *c, stmt_ty s)
             return ERROR;
         }
         if (compiler_enter_scope(c, type_params_name, COMPILER_SCOPE_TYPEPARAMS,
-                                 (void *)type_params, loc.lineno) == -1) {
+                                 (void *)type_params, loc.lineno, loc.end_lineno,
+                                 loc.col_offset, loc.end_col_offset) == -1) {
             Py_DECREF(type_params_name);
             return ERROR;
         }
@@ -3001,7 +3018,8 @@ compiler_lambda(struct compiler *c, expr_ty e)
     _Py_DECLARE_STR(anon_lambda, "<lambda>");
     RETURN_IF_ERROR(
         compiler_enter_scope(c, &_Py_STR(anon_lambda), COMPILER_SCOPE_LAMBDA,
-                             (void *)e, e->lineno));
+                             (void *)e, e->lineno, e->end_lineno,
+                             e->col_offset, e->end_col_offset));
 
     /* Make None the first constant, so the lambda can't have a
        docstring. */
@@ -5769,7 +5787,7 @@ compiler_comprehension(struct compiler *c, expr_ty e, int type,
     }
     else {
         if (compiler_enter_scope(c, name, COMPILER_SCOPE_COMPREHENSION,
-                                (void *)e, e->lineno) < 0)
+                                (void *)e, e->lineno, e->end_lineno, e->col_offset, e->end_col_offset) < 0)
         {
             goto error;
         }
