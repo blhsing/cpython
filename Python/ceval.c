@@ -2476,19 +2476,9 @@ _PyEvalFramePushAndInit(PyThreadState *tstate, _PyStackRef func,
         goto fail;
     }
     _PyFrame_Initialize(tstate, frame, func, locals, code, 0, previous);
-    if (code->co_flags & CO_OPTIMIZED && locals != NULL && locals != func_obj->func_globals &&
-        func_obj->func_defaults == NULL) { // this is NULL only when called by PyEval_EvalCode
-        for (size_t i = 0; i < argcount; i++) {
-            PyStackRef_CLOSE(args[i]);
-        }
-        if (kwnames) {
-            Py_ssize_t kwcount = PyTuple_GET_SIZE(kwnames);
-            for (Py_ssize_t i = 0; i < kwcount; i++) {
-                PyStackRef_CLOSE(args[i+argcount]);
-            }
-        }
-    }
-    else if (initialize_locals(tstate, func_obj, frame->localsplus, args, argcount, kwnames)) {
+    if (!(code->co_flags & CO_OPTIMIZED && locals != NULL && locals != func_obj->func_globals &&
+        func_obj->func_defaults == NULL) && // this is NULL only when called from PyEval_EvalCode
+        initialize_locals(tstate, func_obj, frame->localsplus, args, argcount, kwnames)) {
         assert(frame->owner == FRAME_OWNED_BY_THREAD);
         clear_thread_frame(tstate, frame);
         return NULL;
