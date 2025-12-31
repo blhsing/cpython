@@ -1535,23 +1535,44 @@ _PyEval_SyncLocalsToFast(_PyInterpreterFrame *frame)
     PyObject *locals = frame->f_locals;
     PyCodeObject *co = _PyFrame_GetCode(frame);
     PyObject *names = co->co_localsplusnames;
+    int is_dict = PyDict_Check(locals);
+    int num_args = co->co_argcount + co->co_kwonlyargcount +
+        ((co->co_flags & CO_VARARGS) != 0) + ((co->co_flags & CO_VARKEYWORDS) != 0);
 
     for (int i = 0; i < co->co_nlocalsplus; i++) {
         PyObject *name = PyTuple_GET_ITEM(names, i);
-        PyObject *value = PyObject_GetItem(locals, name);
-        if (value != NULL) {
-            frame->localsplus[i] = PyStackRef_FromPyObjectSteal(value);
-        }
-        else if (PyErr_ExceptionMatches(PyExc_KeyError)) {
-            PyErr_Clear();
+        if (is_dict) {
+            PyObject *value = PyDict_GetItemWithError(locals, name);
+            if (value != NULL) {
+                frame->localsplus[i] = PyStackRef_FromPyObjectSteal(value);
+            }
+            else if (PyErr_Occurred()) {
+                return -1;
+            }
+            else if (i < num_args) {
+                PyErr_Format(PyExc_TypeError, "argument '%U' missing from locals", name);
+                return -1;
+            }
         }
         else {
-            return -1;
+            PyObject *value = PyObject_GetItem(locals, name);
+            if (value != NULL) {
+                frame->localsplus[i] = PyStackRef_FromPyObjectSteal(value);
+            }
+            else if (PyErr_ExceptionMatches(PyExc_KeyError)) {
+                PyErr_Clear();
+                if (i < num_args) {
+                    PyErr_Format(PyExc_TypeError, "argument '%U' missing from locals", name);
+                    return -1;
+                }
+            }
+            else {
+                return -1;
+            }
         }
     }
     return 0;
 }
-
 
 static int
 _PyEval_SyncFastToLocals(_PyInterpreterFrame *frame)
@@ -1559,24 +1580,33 @@ _PyEval_SyncFastToLocals(_PyInterpreterFrame *frame)
     PyObject *locals = frame->f_locals;
     PyCodeObject *co = _PyFrame_GetCode(frame);
     PyObject *names = co->co_localsplusnames;
+    int (*setitem)(PyObject *, PyObject *, PyObject *);
+    int (*delitem)(PyObject *, PyObject *);
 
+    if (PyDict_Check(locals)) {
+        setitem = PyDict_SetItem;
+        delitem = PyDict_DelItem;
+    }
+    else {
+        setitem = PyObject_SetItem;
+        delitem = PyObject_DelItem;
+    }
     for (int i = 0; i < co->co_nlocalsplus; i++) {
         PyObject *name = PyTuple_GET_ITEM(names, i);
         _PyStackRef sref = frame->localsplus[i];
 
         if (PyStackRef_IsNull(sref)) {
-            if (PyObject_DelItem(locals, name) < 0) {
+            if (delitem(locals, name) < 0) {
                 if (PyErr_ExceptionMatches(PyExc_KeyError)) {
                     PyErr_Clear();
-                }
-                else {
+                } else {
                     return -1;
                 }
             }
         }
         else {
             PyObject *obj = PyStackRef_AsPyObjectNew(sref);
-            if (PyObject_SetItem(locals, name, obj) < 0) {
+            if (setitem(locals, name, obj) < 0) {
                 Py_DECREF(obj);
                 return -1;
             }
@@ -1648,7 +1678,7 @@ _PyEval_EvalFrameDefault(PyThreadState *tstate, _PyInterpreterFrame *frame, int 
     tstate->current_frame = frame;
     entry.frame.localsplus[0] = PyStackRef_NULL;
     PyCodeObject *co = _PyFrame_GetCode(frame);
-    if ((co->co_flags & CO_OPTIMIZED) && frame->f_locals != NULL &&
+    if (co->co_flags & CO_OPTIMIZED && frame->f_locals != NULL &&
         frame->f_locals != frame->f_globals && _PyEval_SyncLocalsToFast(frame) < 0) {
         goto early_exit;
     }
@@ -1668,7 +1698,7 @@ _PyEval_EvalFrameDefault(PyThreadState *tstate, _PyInterpreterFrame *frame, int 
         /* Load thread-local bytecode */
         if (frame->tlbc_index != ((_PyThreadStateImpl *)tstate)->tlbc_index) {
             _Py_CODEUNIT *bytecode =
-                _PyEval_GetExecutableCode(tstate, _PyFrame_GetCode(frame));
+                _PyEval_GetExecutableCode(tstate, co);
             if (bytecode == NULL) {
                 goto early_exit;
             }
@@ -2439,9 +2469,9 @@ void
 _PyEval_FrameClearAndPop(PyThreadState *tstate, _PyInterpreterFrame * frame)
 {
     PyCodeObject *co = _PyFrame_GetCode(frame);
-    if ((co->co_flags & CO_OPTIMIZED) && frame->f_locals != NULL &&
+    if (!PyErr_Occurred() && co->co_flags & CO_OPTIMIZED && frame->f_locals != NULL &&
         frame->f_locals != frame->f_globals && _PyEval_SyncFastToLocals(frame) < 0) {
-        /* Ignore any error while the frame is in a teardown state */
+        /* Ignore any error that occurs while the frame is in a teardown state */
         PyErr_WriteUnraisable(frame->f_locals);
     }
     // Update last_profiled_frame for remote profiler frame caching.
