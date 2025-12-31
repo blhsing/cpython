@@ -1123,7 +1123,7 @@ class BuiltinTest(ComplexesAreIdenticalMixin, unittest.TestCase):
                 ns = {'a': 1, 'args': [2], 'kwargs': {'a': 4}}
                 executor(func.__code__, {}, ns, sync_fast_locals=True)
                 self.assertEqual(ns, {'b': 2, 'args': [2, 3], 'kwargs': {'a': 4, 'b': 5}})
-                with assertRaises(TypeError): # argument 'a' missing from locals
+                with self.assertRaises(TypeError): # argument 'a' missing from locals
                     executor(func.__code__, {}, ns, sync_fast_locals=True)
 
     def test_filter(self):
