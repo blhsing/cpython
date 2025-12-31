@@ -2510,7 +2510,8 @@ _PyEvalFramePushAndInit(PyThreadState *tstate, _PyStackRef func,
     /* func_defaults == NULL only happens with a code path from eval/exec => PyEval_EvalCode.
        If it is from PyEval_EvalCodeEx we set locals to globals to prevent fast locals sync */
     if (sync_fast_locals && func_obj->func_defaults != NULL) {
-        locals = func_obj->func_globals;
+        Py_DECREF(locals);
+        locals = Py_NewRef(func_obj->func_globals);
         sync_fast_locals = 0;
     }
     _PyFrame_Initialize(tstate, frame, func, locals, code, 0, previous);
