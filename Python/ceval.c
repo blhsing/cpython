@@ -2505,9 +2505,16 @@ _PyEvalFramePushAndInit(PyThreadState *tstate, _PyStackRef func,
     if (frame == NULL) {
         goto fail;
     }
+    int sync_fast_locals = code->co_flags & CO_OPTIMIZED && locals != NULL &&
+        locals != func_obj->func_globals;
+    /* func_defaults == NULL only happens with a code path from eval/exec => PyEval_EvalCode.
+       If it is from PyEval_EvalCodeEx we set locals to globals to prevent fast locals sync */
+    if (sync_fast_locals && func_obj->func_defaults != NULL) {
+        locals = func_obj->func_globals;
+        sync_fast_locals = 0;
+    }
     _PyFrame_Initialize(tstate, frame, func, locals, code, 0, previous);
-    if (!(code->co_flags & CO_OPTIMIZED && locals != NULL && locals != func_obj->func_globals &&
-        func_obj->func_defaults == NULL) && // this is NULL only when called from PyEval_EvalCode
+    if (!sync_fast_locals &&
         initialize_locals(tstate, func_obj, frame->localsplus, args, argcount, kwnames)) {
         assert(frame->owner == FRAME_OWNED_BY_THREAD);
         clear_thread_frame(tstate, frame);
