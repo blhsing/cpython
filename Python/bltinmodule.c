@@ -1039,9 +1039,10 @@ builtin_eval_impl(PyObject *module, PyObject *source, PyObject *globals,
                 "code object passed to eval() may not contain free variables");
             goto error;
         }
-        if (!sync_fast_locals && ((PyCodeObject *)source)->co_flags & CO_OPTIMIZED) {
+        if (!sync_fast_locals && ((PyCodeObject *)source)->co_flags & CO_OPTIMIZED &&
+            locals != globals) {
             Py_DECREF(locals);
-            locals = globals;
+            locals = Py_NewRef(globals);
         }
         result = PyEval_EvalCode(source, globals, locals);
     }

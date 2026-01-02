@@ -1537,7 +1537,8 @@ _PyEval_SyncLocalsToFast(_PyInterpreterFrame *frame)
     PyObject *names = co->co_localsplusnames;
     int is_dict = PyDict_Check(locals);
     int num_args = co->co_argcount + co->co_kwonlyargcount +
-        ((co->co_flags & CO_VARARGS) != 0) + ((co->co_flags & CO_VARKEYWORDS) != 0);
+        ((co->co_flags & CO_VARARGS) != 0) +
+        ((co->co_flags & CO_VARKEYWORDS) != 0);
 
     for (int i = 0; i < co->co_nlocalsplus; i++) {
         PyObject *name = PyTuple_GET_ITEM(names, i);
@@ -1550,7 +1551,8 @@ _PyEval_SyncLocalsToFast(_PyInterpreterFrame *frame)
                 return -1;
             }
             else if (i < num_args) {
-                PyErr_Format(PyExc_TypeError, "argument '%U' missing from locals", name);
+                PyErr_Format(PyExc_TypeError,
+                             "argument '%U' missing from locals", name);
                 return -1;
             }
         }
@@ -1562,7 +1564,8 @@ _PyEval_SyncLocalsToFast(_PyInterpreterFrame *frame)
             else if (PyErr_ExceptionMatches(PyExc_KeyError)) {
                 PyErr_Clear();
                 if (i < num_args) {
-                    PyErr_Format(PyExc_TypeError, "argument '%U' missing from locals", name);
+                    PyErr_Format(PyExc_TypeError,
+                                 "argument '%U' missing from locals", name);
                     return -1;
                 }
             }
@@ -2469,8 +2472,9 @@ void
 _PyEval_FrameClearAndPop(PyThreadState *tstate, _PyInterpreterFrame * frame)
 {
     PyCodeObject *co = _PyFrame_GetCode(frame);
-    if (!PyErr_Occurred() && co->co_flags & CO_OPTIMIZED && frame->f_locals != NULL &&
-        frame->f_locals != frame->f_globals && _PyEval_SyncFastToLocals(frame) < 0) {
+    if (!PyErr_Occurred() && co->co_flags & CO_OPTIMIZED &&
+        frame->f_locals != NULL && frame->f_locals != frame->f_globals &&
+        _PyEval_SyncFastToLocals(frame) < 0) {
         /* Ignore any error that occurs while the frame is in a teardown state */
         PyErr_WriteUnraisable(frame->f_locals);
     }
@@ -2507,8 +2511,16 @@ _PyEvalFramePushAndInit(PyThreadState *tstate, _PyStackRef func,
     }
     int sync_fast_locals = code->co_flags & CO_OPTIMIZED && locals != NULL &&
         locals != func_obj->func_globals;
-    /* func_defaults == NULL only happens with a code path from eval/exec => PyEval_EvalCode.
-       If it is from PyEval_EvalCodeEx we set locals to globals to prevent fast locals sync */
+    /* The above expression should normally be enough for detecting if the
+       sync_fast_locals flag is set for eval/exec without needing to
+       explicitly propagate an additional flag, but then the expression would
+       be true for code path from PyEval_EvalCodeEx when this legacy API is
+       called with a code object needing locals initialized from passed
+       arguments. So to distinguish code paths between PyEval_EvalCode and
+       PyEval_EvalCodeEx, we take advantage of the implementation detail that
+       func_defaults can be NULL only with a code path from PyEval_EvalCode.
+       If it is from PyEval_EvalCodeEx we want to prevent a fast locals sync
+       by setting locals to globals. */
     if (sync_fast_locals && func_obj->func_defaults != NULL) {
         Py_DECREF(locals);
         locals = Py_NewRef(func_obj->func_globals);
@@ -2516,7 +2528,8 @@ _PyEvalFramePushAndInit(PyThreadState *tstate, _PyStackRef func,
     }
     _PyFrame_Initialize(tstate, frame, func, locals, code, 0, previous);
     if (!sync_fast_locals &&
-        initialize_locals(tstate, func_obj, frame->localsplus, args, argcount, kwnames)) {
+        initialize_locals(tstate, func_obj, frame->localsplus, args,
+                          argcount, kwnames)) {
         assert(frame->owner == FRAME_OWNED_BY_THREAD);
         clear_thread_frame(tstate, frame);
         return NULL;
