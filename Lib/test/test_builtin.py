@@ -1112,19 +1112,24 @@ class BuiltinTest(ComplexesAreIdenticalMixin, unittest.TestCase):
             self.assertIs(wm.category, SyntaxWarning)
 
     def test_eval_exec_sync_fast_locals(self):
-        def func(a, *args, **kwargs):
-            b = a + 1
-            del a
-            args.append(3)
-            kwargs['b'] = kwargs['a'] + 1
+        def func(a, *args, kw=None, **kwargs):
+            b = a + kw
+            del kw
+            args[0] += 2
+            kwargs['b'] = kwargs.pop('a') + 2
 
+        code = func.__code__
+        args = {'a': 1, 'args': [1], 'kw': 2, 'kwargs': {'a': 1}}
         for executor in eval, exec:
             with self.subTest(executor=executor.__name__):
-                ns = {'a': 1, 'args': [2], 'kwargs': {'a': 4}}
-                executor(func.__code__, {}, ns, sync_fast_locals=True)
-                self.assertEqual(ns, {'b': 2, 'args': [2, 3], 'kwargs': {'a': 4, 'b': 5}})
-                with self.assertRaises(TypeError): # argument 'a' missing from locals
-                    executor(func.__code__, {}, ns, sync_fast_locals=True)
+                ns = args.copy()
+                executor(code, {}, args, sync_fast_locals=True)
+                self.assertEqual(ns, {'a': 1, 'b': 3, 'args': [3], 'kwargs': {'b': 3}})
+                for missing_arg in args:
+                    ns = args.copy()
+                    del ns[missing_arg]
+                    with self.subTest(missing_arg=missing_arg), self.assertRaises(TypeError):
+                        executor(code, {}, ns, sync_fast_locals=True)
 
     def test_filter(self):
         self.assertEqual(list(filter(lambda c: 'a' <= c <= 'z', 'Hello World')), list('elloorld'))

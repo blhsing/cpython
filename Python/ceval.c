@@ -2514,13 +2514,13 @@ _PyEvalFramePushAndInit(PyThreadState *tstate, _PyStackRef func,
     /* The above expression should normally be enough for detecting if the
        sync_fast_locals flag is set for eval/exec without needing to
        explicitly propagate an additional flag, but then the expression would
-       be true for code path from PyEval_EvalCodeEx when this legacy API is
-       called with a code object needing locals initialized from passed
+       produce a false positive for code path from PyEval_EvalCodeEx when it
+       is called with a code object that needs locals initialized from passed
        arguments. So to distinguish code paths between PyEval_EvalCode and
        PyEval_EvalCodeEx, we take advantage of the implementation detail that
-       func_defaults can be NULL only with a code path from PyEval_EvalCode.
-       If it is from PyEval_EvalCodeEx we want to prevent a fast locals sync
-       by setting locals to globals. */
+       func_defaults can ever be NULL with a code path from PyEval_EvalCode.
+       If the call is from PyEval_EvalCodeEx we want to prevent a fast locals
+       sync by setting locals to globals. */
     if (sync_fast_locals && func_obj->func_defaults != NULL) {
         Py_DECREF(locals);
         locals = Py_NewRef(func_obj->func_globals);
