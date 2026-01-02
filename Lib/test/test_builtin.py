@@ -4,6 +4,7 @@ import ast
 import builtins
 import collections
 import contextlib
+import copy
 import decimal
 import fractions
 import gc
@@ -1122,7 +1123,7 @@ class BuiltinTest(ComplexesAreIdenticalMixin, unittest.TestCase):
         args = {'a': 1, 'args': [1], 'kw': 2, 'kwargs': {'a': 1}}
         for executor in eval, exec:
             with self.subTest(executor=executor.__name__):
-                ns = args.copy()
+                ns = copy.deepcopy(args)
                 executor(code, {}, args, sync_fast_locals=True)
                 self.assertEqual(ns, {'a': 1, 'b': 3, 'args': [3], 'kwargs': {'b': 3}})
                 for missing_arg in args:
