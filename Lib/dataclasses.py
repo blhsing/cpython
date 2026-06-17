@@ -469,6 +469,11 @@ class _FuncBuilder:
         self.src.append(f'{f' {decorator}\n' if decorator else ''} def {name}({args}):\n{body}')
 
     def add_fns_to_class(self, cls):
+        # Nothing was queued (e.g. generic mode handled every method
+        # directly): skip the compile()/exec() entirely.
+        if not self.names:
+            return
+
         # The source to all of the functions we're generating.
         fns_src = '\n'.join(self.src)
 
@@ -995,6 +1000,479 @@ class _AutoDocstring:
 _auto_docstring = _AutoDocstring()
 
 
+# ======================================================================
+# EXPERIMENTAL: metadata-driven generic methods (no per-class codegen).
+#
+# Gated behind the DATACLASSES_GENERIC environment variable so default
+# behavior is unchanged:
+#     DATACLASSES_GENERIC=copy    -> per-class function copies that share
+#                                    one module-level code object (correct
+#                                    __name__/__qualname__, still no compile)
+#     DATACLASSES_GENERIC=shared  -> a single shared function per method
+#                                    (fastest build; generic __qualname__)
+#
+# The point is to avoid compile() per class -- the dominant dataclass
+# *build* cost -- by installing functions that read a precomputed per-class
+# spec at call time instead of baking field names into generated source.
+# ======================================================================
+def _generic_mode():
+    try:
+        import os
+        return os.environ.get('DATACLASSES_GENERIC') or None
+    except Exception:
+        return None
+
+_GENERIC_MODE = _generic_mode()
+_USE_GENERIC_METHODS = _GENERIC_MODE in ('copy', 'shared', 'c')
+
+# DATACLASSES_GENERIC=c installs fixed C implementations (from the _dataclasses
+# accelerator) that read the same per-class metadata at call time -- no compile
+# and no per-call Python bytecode.
+_c_accel = None
+if _GENERIC_MODE == 'c':
+    import _dataclasses as _c_accel
+
+# Parameter kinds for the init spec.
+_GEN_REQUIRED = 0
+_GEN_DEFAULT = 1
+_GEN_FACTORY = 2
+
+# Assignment modes.
+_GEN_A_BOUND = 0     # setattr from the bound parameter value
+_GEN_A_FACTORY = 1   # init=False field: always call factory, then assign
+_GEN_A_CONST = 2     # init=False field with a default (slots): assign default
+
+
+class _InitSpec:
+    __slots__ = ('pos', 'kwonly', 'assignments', 'initvar_names',
+                 'has_post_init', 'frozen', 'fast')
+
+    def __init__(self, pos, kwonly, assignments, initvar_names,
+                 has_post_init, frozen):
+        self.pos = pos
+        self.kwonly = kwonly
+        self.assignments = assignments
+        self.initvar_names = initvar_names
+        self.has_post_init = has_post_init
+        self.frozen = frozen
+        # "fast" == the common shape the C accelerator can bind+assign in a
+        # single pass with no temporary dict: every field is a plain
+        # positional-or-keyword init field assigned in declaration order,
+        # with no kw-only fields, InitVars, or __post_init__.
+        self.fast = (
+            not has_post_init
+            and not kwonly
+            and not initvar_names
+            and len(assignments) == len(pos)
+            and all(assignments[i][1] == 0 and assignments[i][0] == pos[i][0]
+                    for i in range(len(pos)))
+        )
+
+
+def _make_init_spec(all_init_fields, std_init_fields, kw_only_init_fields,
+                    frozen, has_post_init, slots):
+    # Same validation the codegen path gets for free from exec(): a
+    # non-default argument may not follow a default one.
+    seen_default = None
+    for f in std_init_fields:
+        if not (f.default is MISSING and f.default_factory is MISSING):
+            seen_default = f
+        elif seen_default:
+            raise TypeError(f'non-default argument {f.name!r} '
+                            f'follows default argument {seen_default.name!r}')
+
+    def param_tuple(f):
+        if f.default_factory is not MISSING:
+            return (f.name, _GEN_FACTORY, f.default_factory)
+        elif f.default is not MISSING:
+            return (f.name, _GEN_DEFAULT, f.default)
+        else:
+            return (f.name, _GEN_REQUIRED, None)
+
+    pos = tuple(param_tuple(f) for f in std_init_fields)
+    kwonly = tuple(param_tuple(f) for f in kw_only_init_fields)
+
+    assignments = []
+    initvar_names = []
+    for f in all_init_fields:
+        if f._field_type is _FIELD_INITVAR:
+            if f.init:
+                initvar_names.append(f.name)
+            continue
+        # A real field (_FIELD).
+        if f.init:
+            assignments.append((f.name, _GEN_A_BOUND, None))
+        elif f.default_factory is not MISSING:
+            assignments.append((f.name, _GEN_A_FACTORY, f.default_factory))
+        elif slots and f.default is not MISSING:
+            assignments.append((f.name, _GEN_A_CONST, f.default))
+        # else: no assignment (reading falls back to the class attribute).
+    return _InitSpec(pos, kwonly, tuple(assignments), tuple(initvar_names),
+                     has_post_init, frozen)
+
+
+def _dataclass_generic_init(__dataclass_self__, /, *args, **kwargs):
+    # IMPORTANT: this body must reference only builtins and the per-class
+    # spec (read off the type).  The per-class copies install it with
+    # __globals__ pointing at the *user* module (so string annotations on
+    # __init__ resolve like the codegen path), where dataclasses' own
+    # module-level names are not visible.  Parameter "kinds" are inlined as
+    # ints to match _make_init_spec: 0=required, 1=default, 2=factory;
+    # assignment "modes": 0=bound, 1=factory, 2=const.
+    self = __dataclass_self__
+    cls = type(self)
+    spec = cls.__dataclass_init_spec__
+    pos = spec.pos
+    npos = len(pos)
+    nargs = len(args)
+    if nargs > npos:
+        plural = 'argument' if npos + 1 == 1 else 'arguments'
+        raise TypeError(
+            f'{cls.__qualname__}.__init__() takes {npos + 1} positional '
+            f'{plural} but {nargs + 1} were given')
+    bound = {}
+    # Bind positional arguments.
+    i = 0
+    while i < nargs:
+        name = pos[i][0]
+        if name in kwargs:
+            raise TypeError(
+                f'{cls.__qualname__}.__init__() got multiple values for '
+                f'argument {name!r}')
+        bound[name] = args[i]
+        i += 1
+    # Resolve the remaining positional-or-keyword parameters.
+    missing_pos = []
+    while i < npos:
+        name, kind, extra = pos[i]
+        if name in kwargs:
+            bound[name] = kwargs.pop(name)
+        elif kind == 1:          # default value
+            bound[name] = extra
+        elif kind == 2:          # default factory
+            bound[name] = extra()
+        else:                    # required
+            missing_pos.append(name)
+        i += 1
+    if missing_pos:
+        n = len(missing_pos)
+        q = [repr(x) for x in missing_pos]
+        j = q[0] if n == 1 else (f'{q[0]} and {q[1]}' if n == 2
+                                 else ', '.join(q[:-1]) + f', and {q[-1]}')
+        raise TypeError(
+            f"{cls.__qualname__}.__init__() missing {n} required positional "
+            f"argument{'' if n == 1 else 's'}: {j}")
+    # Keyword-only parameters.
+    missing_kw = []
+    for name, kind, extra in spec.kwonly:
+        if name in kwargs:
+            bound[name] = kwargs.pop(name)
+        elif kind == 1:
+            bound[name] = extra
+        elif kind == 2:
+            bound[name] = extra()
+        else:
+            missing_kw.append(name)
+    if missing_kw:
+        n = len(missing_kw)
+        q = [repr(x) for x in missing_kw]
+        j = q[0] if n == 1 else (f'{q[0]} and {q[1]}' if n == 2
+                                 else ', '.join(q[:-1]) + f', and {q[-1]}')
+        raise TypeError(
+            f"{cls.__qualname__}.__init__() missing {n} required keyword-only "
+            f"argument{'' if n == 1 else 's'}: {j}")
+    if kwargs:
+        raise TypeError(
+            f'{cls.__qualname__}.__init__() got an unexpected keyword '
+            f'argument {next(iter(kwargs))!r}')
+    # Assign fields, in declaration order.
+    if spec.frozen:
+        setter = object.__setattr__
+        for name, mode, extra in spec.assignments:
+            if mode == 0:            # bound value
+                setter(self, name, bound[name])
+            elif mode == 1:          # factory
+                setter(self, name, extra())
+            else:                    # const default
+                setter(self, name, extra)
+    else:
+        for name, mode, extra in spec.assignments:
+            if mode == 0:
+                setattr(self, name, bound[name])
+            elif mode == 1:
+                setattr(self, name, extra())
+            else:
+                setattr(self, name, extra)
+    if spec.has_post_init:
+        self.__post_init__(*[bound[n] for n in spec.initvar_names])
+
+
+@recursive_repr()
+def _dataclass_generic_repr(self):
+    cls = type(self)
+    names = cls.__dataclass_repr_fields__
+    inner = ', '.join([f'{n}={getattr(self, n)!r}' for n in names])
+    return f'{cls.__qualname__}({inner})'
+
+
+def _dataclass_generic_eq(self, other):
+    if self is other:
+        return True
+    if other.__class__ is self.__class__:
+        for n in type(self).__dataclass_eq_fields__:
+            if not (getattr(self, n) == getattr(other, n)):
+                return False
+        return True
+    return NotImplemented
+
+
+def _dataclass_generic_hash(self):
+    return hash(tuple(getattr(self, n)
+                      for n in type(self).__dataclass_hash_fields__))
+
+
+# Set sensible names on the shared templates.
+_dataclass_generic_init.__name__ = '__init__'
+_dataclass_generic_init.__qualname__ = '__init__'
+_dataclass_generic_repr.__name__ = '__repr__'
+_dataclass_generic_repr.__qualname__ = '__repr__'
+_dataclass_generic_eq.__name__ = '__eq__'
+_dataclass_generic_eq.__qualname__ = '__eq__'
+_dataclass_generic_hash.__name__ = '__hash__'
+_dataclass_generic_hash.__qualname__ = '__hash__'
+
+
+def _generic_method(template, cls, name):
+    # Return the function object to install as cls.<name>.  In 'shared'
+    # mode this is the template itself; in 'copy' mode it is a thin
+    # per-class function that reuses the template's (already compiled)
+    # code object but carries a correct per-class __qualname__.
+    if _GENERIC_MODE == 'shared':
+        return template
+    inner = getattr(template, '__wrapped__', template)
+    # Install with the *user* module's globals (like the codegen path), so
+    # string annotations on __init__ resolve correctly.  The bodies only use
+    # builtins + the per-class spec, so they don't need dataclasses' globals.
+    module = sys.modules.get(cls.__module__)
+    g = module.__dict__ if module is not None else {}
+    fn = types.FunctionType(inner.__code__, g, name)
+    fn.__qualname__ = f'{cls.__qualname__}.{name}'
+    if template is not inner:
+        # Re-apply the recursive_repr guard around the per-class copy.
+        fn = recursive_repr()(fn)
+        fn.__qualname__ = f'{cls.__qualname__}.{name}'
+    return fn
+
+
+def _make_frozen_set_del(__class__, fieldset):
+    # The parameter is named __class__ on purpose: it makes zero-arg
+    # super() work inside the closures *and* exposes a __class__ free
+    # variable cell that _add_slots() can re-point at the slotted class
+    # (exactly like the codegen path's generated cell).
+    def __setattr__(self, name, value):
+        if type(self) is __class__ or name in fieldset:
+            raise FrozenInstanceError(f"cannot assign to field {name!r}")
+        super().__setattr__(name, value)
+
+    def __delattr__(self, name):
+        if type(self) is __class__ or name in fieldset:
+            raise FrozenInstanceError(f"cannot delete field {name!r}")
+        super().__delattr__(name)
+
+    return __setattr__, __delattr__
+
+
+def _install_frozen_set_del(cls, field_list):
+    fieldset = frozenset(f.name for f in field_list)
+    set_fn, del_fn = _make_frozen_set_del(cls, fieldset)
+    for name, fn in (('__setattr__', set_fn), ('__delattr__', del_fn)):
+        fn.__qualname__ = f'{cls.__qualname__}.{name}'
+        if _set_new_attribute(cls, name, fn):
+            raise TypeError(f'Cannot overwrite attribute {name} '
+                            f'in class {cls.__name__}')
+
+
+def _dataclass_init_parameters(cls, with_self):
+    # Build inspect.Parameter list for the generated __init__ from the spec.
+    # Annotations use FORWARDREF (like the codegen path's docstring), which
+    # resolves what it can (so `param.annotation is int`) and leaves the rest
+    # as ForwardRefs (so undefined names still render in docstrings).
+    import inspect
+    spec = cls.__dataclass_init_spec__
+    anns = annotationlib.get_annotations(
+        cls, format=annotationlib.Format.FORWARDREF)
+    P = inspect.Parameter
+    empty = P.empty
+    params = []
+    if with_self:
+        names = {n for (n, _, _) in spec.pos}
+        names.update(n for (n, _, _) in spec.kwonly)
+        params.append(P('__dataclass_self__' if 'self' in names else 'self',
+                        P.POSITIONAL_OR_KEYWORD))
+
+    def make(name, kind, extra, pkind):
+        if kind == 1:                  # default value
+            default = extra
+        elif kind == 2:                # default factory
+            default = _HAS_DEFAULT_FACTORY
+        else:                          # required
+            default = empty
+        return P(name, pkind, default=default, annotation=anns.get(name, empty))
+
+    for (name, kind, extra) in spec.pos:
+        params.append(make(name, kind, extra, P.POSITIONAL_OR_KEYWORD))
+    for (name, kind, extra) in spec.kwonly:
+        params.append(make(name, kind, extra, P.KEYWORD_ONLY))
+    return params
+
+
+def _dataclass_signature(cls, with_self):
+    import inspect
+    return inspect.Signature(_dataclass_init_parameters(cls, with_self),
+                             return_annotation=None)
+
+
+class _GenericInitSignature:
+    # Lazy signature carrier for the generic __init__.  inspect.unwrap()
+    # follows __wrapped__ and stops when it finds __signature__, so exposing
+    # __signature__ as a property lets us build the Signature on first access
+    # rather than at class-creation time.  That keeps build cheap *and* lets
+    # ForwardRef annotations -- including the class's own name in a recursive
+    # field like `x: list[C]` -- resolve, since by access time the name is
+    # bound.  (A C accelerator would expose this as a tp_getset instead.)
+    __slots__ = ('_cls', '_sig')
+
+    def __init__(self, cls):
+        self._cls = cls
+        self._sig = None
+
+    @property
+    def __signature__(self):
+        if self._sig is None:
+            self._sig = _dataclass_signature(self._cls, with_self=True)
+        return self._sig
+
+    @property
+    def __globals__(self):
+        # get_type_hints() follows __wrapped__ to find globals for resolving
+        # string annotations; hand it the class's module like a real __init__.
+        module = sys.modules.get(self._cls.__module__)
+        return module.__dict__ if module is not None else {}
+
+
+def _install_generic_init_signature(cls):
+    # Make inspect.signature(cls) and inspect.signature(cls.__init__) work
+    # for the generic __init__ (whose code object is all *args/**kwargs).
+    # We deliberately do NOT set cls.__signature__: leaving it unset lets
+    # inspect use its normal class resolution (metaclass __call__, user
+    # __init__, ...) so edge cases match the codegen path exactly.
+    init_method = cls.__dict__.get('__init__')
+    if (init_method is None or
+            getattr(init_method, '__code__', None)
+            is not _dataclass_generic_init.__code__):
+        return
+    init_method.__wrapped__ = _GenericInitSignature(cls)
+
+
+def _install_generic_methods(cls, fields, all_init_fields, std_init_fields,
+                             kw_only_init_fields, field_list, init, repr_, eq,
+                             order, frozen, has_post_init, slots,
+                             unsafe_hash, has_explicit_hash):
+    use_c = _GENERIC_MODE == 'c'
+    if init:
+        spec = _make_init_spec(
+            all_init_fields, std_init_fields, kw_only_init_fields,
+            frozen, has_post_init, slots)
+        cls.__dataclass_init_spec__ = spec
+        if use_c:
+            # Cache a C-native view of the spec so dc_init reads one capsule
+            # then a tight C loop -- no per-call attribute/PyLong work.
+            c_spec = _c_accel.make_cspec(spec, cls)
+            cls.__dataclass_c_spec__ = c_spec
+            annotation_fields = [f.name for f in all_init_fields if f.init]
+            init_annotate = _make_annotate_function(
+                cls, '__init__', annotation_fields, None)
+            init_wrapped = _GenericInitSignature(cls)
+            if not _set_new_attribute(cls, '__init__',
+                                      _c_accel.make_init(
+                                          c_spec, cls, init_annotate,
+                                          init_wrapped)):
+                _c_accel.install_tp_init(cls)
+        else:
+            init_fn = _generic_method(_dataclass_generic_init, cls, '__init__')
+            if _GENERIC_MODE != 'shared':
+                # Attach the same __annotate__ the codegen path would, so
+                # inspect.signature()/get_type_hints() see the field types
+                # and the None return.  (Requires a per-class function.)
+                annotation_fields = [f.name for f in all_init_fields if f.init]
+                init_fn.__annotate__ = _make_annotate_function(
+                    cls, '__init__', annotation_fields, None)
+            _set_new_attribute(cls, '__init__', init_fn)
+    if repr_:
+        cls.__dataclass_repr_fields__ = repr_fields = tuple(
+            f.name for f in field_list if f.repr)
+        _set_new_attribute(cls, '__repr__',
+                           _c_accel.make_repr(repr_fields, cls) if use_c else
+                           _generic_method(_dataclass_generic_repr, cls,
+                                           '__repr__'))
+    if eq:
+        cls.__dataclass_eq_fields__ = eq_fields = tuple(
+            f.name for f in field_list if f.compare)
+        _set_new_attribute(cls, '__eq__',
+                           _c_accel.make_eq(eq_fields, cls) if use_c else
+                           _generic_method(_dataclass_generic_eq, cls,
+                                           '__eq__'))
+    # Hash, mirroring the _hash_action table decision.
+    hash_action = _hash_action[bool(unsafe_hash), bool(eq), bool(frozen),
+                               has_explicit_hash]
+    if hash_action is _hash_set_none:
+        cls.__hash__ = None
+    elif hash_action is _hash_add:
+        flds = [f for f in field_list
+                if (f.compare if f.hash is None else f.hash)]
+        cls.__dataclass_hash_fields__ = hash_fields = tuple(f.name for f in flds)
+        cls.__hash__ = (_c_accel.make_hash(hash_fields, cls) if use_c else
+                        _generic_method(_dataclass_generic_hash, cls,
+                                        '__hash__'))
+    elif hash_action is _hash_exception:
+        _hash_exception(cls, field_list, None)
+    # order and frozen set/del still go through the codegen func_builder.
+
+
+def _c_init_metadata(cls):
+    spec = cls.__dataclass_init_spec__
+    annotation_fields = [n for n, _, _ in spec.pos]
+    annotation_fields.extend(n for n, _, _ in spec.kwonly)
+    return (_make_annotate_function(cls, '__init__', annotation_fields, None),
+            _GenericInitSignature(cls))
+
+
+def _rebind_c_methods(cls):
+    method_type = type(_c_accel.init)
+    if type(cls.__dict__.get('__init__')) is method_type:
+        c_spec = _c_accel.make_cspec(cls.__dataclass_init_spec__, cls)
+        cls.__dataclass_c_spec__ = c_spec
+        init_annotate, init_wrapped = _c_init_metadata(cls)
+        cls.__init__ = _c_accel.make_init(
+            c_spec, cls, init_annotate, init_wrapped)
+        _c_accel.install_tp_init(cls)
+    if type(cls.__dict__.get('__repr__')) is method_type:
+        cls.__repr__ = _c_accel.make_repr(cls.__dataclass_repr_fields__, cls)
+    if type(cls.__dict__.get('__eq__')) is method_type:
+        cls.__eq__ = _c_accel.make_eq(cls.__dataclass_eq_fields__, cls)
+    if type(cls.__dict__.get('__hash__')) is method_type:
+        cls.__hash__ = _c_accel.make_hash(cls.__dataclass_hash_fields__, cls)
+
+
+def _discard_c_methods(cls):
+    method_type = type(_c_accel.init)
+    for name in ('__init__', '__repr__', '__eq__', '__hash__'):
+        if type(cls.__dict__.get(name)) is method_type:
+            delattr(cls, name)
+    if '__dataclass_c_spec__' in cls.__dict__:
+        delattr(cls, '__dataclass_c_spec__')
+
+
 def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
                    match_args, kw_only, slots, weakref_slot):
     # Now that dicts retain insertion order, there's no reason to use
@@ -1142,53 +1620,62 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
 
     func_builder = _FuncBuilder(globals)
 
-    if init:
-        # Does this class have a post-init function?
-        has_post_init = hasattr(cls, _POST_INIT_NAME)
-
-        _init_fn(all_init_fields,
-                 std_init_fields,
-                 kw_only_init_fields,
-                 frozen,
-                 has_post_init,
-                 # The name to use for the "self"
-                 # param in __init__.  Use "self"
-                 # if possible.
-                 '__dataclass_self__' if 'self' in fields
-                 else 'self',
-                 func_builder,
-                 slots,
-                 )
-
-    _set_new_attribute(cls, '__replace__', _replace)
+    # Does this class have a post-init function?
+    has_post_init = hasattr(cls, _POST_INIT_NAME)
 
     # Get the fields as a list, and include only real fields.  This is
     # used in all of the following methods.
     field_list = [f for f in fields.values() if f._field_type is _FIELD]
 
-    if repr:
-        flds = [f for f in field_list if f.repr]
-        func_builder.add_fn('__repr__',
-                            ('self',),
-                            ['  return f"{self.__class__.__qualname__}(' +
-                             ', '.join([f"{f.name}={{self.{f.name}!r}}"
-                                        for f in flds]) + ')"'],
-                            locals={'__dataclasses_recursive_repr': recursive_repr},
-                            decorator="@__dataclasses_recursive_repr()")
+    if _USE_GENERIC_METHODS:
+        # Install shared, metadata-driven __init__/__repr__/__eq__/__hash__
+        # instead of generating and compiling per-class source.
+        _install_generic_methods(
+            cls, fields, all_init_fields, std_init_fields,
+            kw_only_init_fields, field_list, init, repr, eq, order,
+            frozen, has_post_init, slots, unsafe_hash, has_explicit_hash)
+        _set_new_attribute(cls, '__replace__', _replace)
+    else:
+        if init:
+            _init_fn(all_init_fields,
+                     std_init_fields,
+                     kw_only_init_fields,
+                     frozen,
+                     has_post_init,
+                     # The name to use for the "self"
+                     # param in __init__.  Use "self"
+                     # if possible.
+                     '__dataclass_self__' if 'self' in fields
+                     else 'self',
+                     func_builder,
+                     slots,
+                     )
 
-    if eq:
-        # Create __eq__ method.  There's no need for a __ne__ method,
-        # since python will call __eq__ and negate it.
-        cmp_fields = (field for field in field_list if field.compare)
-        terms = [f'self.{field.name}==other.{field.name}' for field in cmp_fields]
-        field_comparisons = ' and '.join(terms) or 'True'
-        func_builder.add_fn('__eq__',
-                            ('self', 'other'),
-                            [ '  if self is other:',
-                              '   return True',
-                              '  if other.__class__ is self.__class__:',
-                             f'   return {field_comparisons}',
-                              '  return NotImplemented'])
+        _set_new_attribute(cls, '__replace__', _replace)
+
+        if repr:
+            flds = [f for f in field_list if f.repr]
+            func_builder.add_fn('__repr__',
+                                ('self',),
+                                ['  return f"{self.__class__.__qualname__}(' +
+                                 ', '.join([f"{f.name}={{self.{f.name}!r}}"
+                                            for f in flds]) + ')"'],
+                                locals={'__dataclasses_recursive_repr': recursive_repr},
+                                decorator="@__dataclasses_recursive_repr()")
+
+        if eq:
+            # Create __eq__ method.  There's no need for a __ne__ method,
+            # since python will call __eq__ and negate it.
+            cmp_fields = (field for field in field_list if field.compare)
+            terms = [f'self.{field.name}==other.{field.name}' for field in cmp_fields]
+            field_comparisons = ' and '.join(terms) or 'True'
+            func_builder.add_fn('__eq__',
+                                ('self', 'other'),
+                                [ '  if self is other:',
+                                  '   return True',
+                                  '  if other.__class__ is self.__class__:',
+                                 f'   return {field_comparisons}',
+                                  '  return NotImplemented'])
 
     if order:
         # Create and set the ordering methods.
@@ -1212,15 +1699,20 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
                             overwrite_error='Consider using functools.total_ordering')
 
     if frozen:
-        _frozen_set_del_attr(cls, field_list, func_builder)
+        if _USE_GENERIC_METHODS:
+            _install_frozen_set_del(cls, field_list)
+        else:
+            _frozen_set_del_attr(cls, field_list, func_builder)
 
-    # Decide if/how we're going to create a hash function.
-    hash_action = _hash_action[bool(unsafe_hash),
-                               bool(eq),
-                               bool(frozen),
-                               has_explicit_hash]
-    if hash_action:
-        cls.__hash__ = hash_action(cls, field_list, func_builder)
+    if not _USE_GENERIC_METHODS:
+        # Decide if/how we're going to create a hash function.  (Generic
+        # mode makes this decision inside _install_generic_methods.)
+        hash_action = _hash_action[bool(unsafe_hash),
+                                   bool(eq),
+                                   bool(frozen),
+                                   has_explicit_hash]
+        if hash_action:
+            cls.__hash__ = hash_action(cls, field_list, func_builder)
 
     # Generate the methods and add them to the class.
     func_builder.add_fns_to_class(cls)
@@ -1239,7 +1731,16 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
     if weakref_slot and not slots:
         raise TypeError('weakref_slot is True but slots is False')
     if slots:
+        oldcls = cls
         cls = _add_slots(cls, frozen, weakref_slot, fields)
+        if _GENERIC_MODE == 'c':
+            _rebind_c_methods(cls)
+            _discard_c_methods(oldcls)
+
+    if _USE_GENERIC_METHODS and init:
+        # Done after _add_slots so ForwardRef annotations bind to the final
+        # class and don't keep the pre-slots class alive.
+        _install_generic_init_signature(cls)
 
     abc.update_abstractmethods(cls)
 
