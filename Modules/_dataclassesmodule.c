@@ -33,6 +33,7 @@ static PyObject *S_c_spec;
 static PyObject *S_repr_fields;
 static PyObject *S_eq_fields;
 static PyObject *S_hash_fields;
+static PyObject *S_init;
 static PyObject *S_qualname;
 static PyObject *S_post_init;
 static PyObject *S_pos;
@@ -69,6 +70,7 @@ typedef struct {
     int frozen;
     int fast;
     int inline_ready;
+    int all_slots_ready;
     unsigned int inline_type_version;
     PyObject *param_index;
     PyObject *owner_spec;   /* strong ref: keeps the borrowed PyObjects alive */
@@ -99,8 +101,15 @@ typedef struct {
     PyObject *owner_tuple;      /* strong ref: keeps field names alive */
     PyTypeObject *owner_type;   /* borrowed: descriptor is owned by type */
     int inline_ready;
+    int all_slots_ready;
     unsigned int inline_type_version;
 } dc_field_spec;
+
+static int member_object_slot_offset_type(PyTypeObject *, PyObject *,
+                                          Py_ssize_t *);
+static void precompute_store_slots(dc_cspec *);
+static void precompute_load_slots(dc_field_spec *);
+static dc_cspec *type_init_cspec(PyTypeObject *);
 
 static void
 cspec_destructor(PyObject *capsule)
@@ -246,6 +255,7 @@ make_cspec(PyObject *Py_UNUSED(mod), PyObject *const *args, Py_ssize_t nargs)
     cs->fast = PyObject_IsTrue(fst);
     cs->owner_spec = Py_NewRef(spec);
     cs->owner_type = (PyTypeObject *)cls;
+    precompute_store_slots(cs);
 
     Py_DECREF(pos);
     Py_DECREF(kwonly);
@@ -332,6 +342,7 @@ make_field_spec(PyObject *fields, PyObject *cls)
             fs->fields[i].inline_offset = -1;
         }
     }
+    precompute_load_slots(fs);
     return fs;
 }
 
@@ -500,17 +511,20 @@ update_inline_ready(PyObject *self, dc_cspec *cs)
 #ifndef Py_GIL_DISABLED
     PyTypeObject *tp = Py_TYPE(self);
     cs->inline_ready = 0;
+    cs->all_slots_ready = 0;
     cs->inline_type_version = 0;
     if (tp != cs->owner_type)
     {
         return;
     }
+    int all_slots = 1;
     for (Py_ssize_t i = 0; i < cs->nassign; i++) {
         dc_slot *a = &cs->assignments[i];
         if (a->type_version != tp->tp_version_tag || a->inline_offset < 0) {
             return;
         }
         if (a->store_kind == DC_STORE_INLINE) {
+            all_slots = 0;
             if (!(tp->tp_flags & Py_TPFLAGS_INLINE_VALUES) ||
                 _PyObject_GetManagedDict(self) != NULL)
             {
@@ -526,20 +540,21 @@ update_inline_ready(PyObject *self, dc_cspec *cs)
         }
     }
     cs->inline_ready = 1;
+    cs->all_slots_ready = all_slots;
     cs->inline_type_version = tp->tp_version_tag;
 #endif
 }
 
 static int
-member_object_slot_offset(PyObject *self, PyObject *descr,
-                          Py_ssize_t *offset)
+member_object_slot_offset_type(PyTypeObject *tp, PyObject *descr,
+                               Py_ssize_t *offset)
 {
     if (!Py_IS_TYPE(descr, &PyMemberDescr_Type)) {
         return 0;
     }
     PyMemberDescrObject *member = (PyMemberDescrObject *)descr;
     PyMemberDef *dmem = member->d_member;
-    if (!PyObject_TypeCheck(self, member->d_common.d_type) ||
+    if (!PyType_IsSubtype(tp, member->d_common.d_type) ||
         (dmem->flags & Py_READONLY) ||
         (dmem->flags & _Py_AFTER_ITEMS) ||
         !(dmem->type == Py_T_OBJECT_EX || dmem->type == _Py_T_OBJECT) ||
@@ -549,6 +564,55 @@ member_object_slot_offset(PyObject *self, PyObject *descr,
     }
     *offset = dmem->offset;
     return 1;
+}
+
+static int
+member_object_slot_offset(PyObject *self, PyObject *descr,
+                          Py_ssize_t *offset)
+{
+    return member_object_slot_offset_type(Py_TYPE(self), descr, offset);
+}
+
+static void
+precompute_store_slots(dc_cspec *cs)
+{
+#ifndef Py_GIL_DISABLED
+    PyTypeObject *tp = cs->owner_type;
+    if (tp == NULL) {
+        return;
+    }
+    int all_slots = 1;
+    cs->inline_ready = 0;
+    cs->all_slots_ready = 0;
+    cs->inline_type_version = 0;
+    for (Py_ssize_t i = 0; i < cs->nassign; i++) {
+        dc_slot *a = &cs->assignments[i];
+        unsigned int version = 0;
+        PyObject *descr = _PyType_LookupRefAndVersion(tp, a->name, &version);
+        if (version == 0) {
+            Py_XDECREF(descr);
+            all_slots = 0;
+            continue;
+        }
+        Py_ssize_t slot_offset = -1;
+        if (descr != NULL &&
+            member_object_slot_offset_type(tp, descr, &slot_offset))
+        {
+            a->store_kind = DC_STORE_SLOT;
+            a->type_version = version;
+            a->inline_offset = slot_offset;
+        }
+        else {
+            all_slots = 0;
+        }
+        Py_XDECREF(descr);
+    }
+    if (all_slots) {
+        cs->inline_ready = 1;
+        cs->all_slots_ready = 1;
+        cs->inline_type_version = tp->tp_version_tag;
+    }
+#endif
 }
 
 static void
@@ -584,6 +648,7 @@ refresh_store_cache(dc_cspec *cs, dc_slot *a, PyObject *self)
     a->type_version = 0;
     a->inline_offset = -1;
     cs->inline_ready = 0;
+    cs->all_slots_ready = 0;
     cs->inline_type_version = 0;
 
     PyTypeObject *tp = Py_TYPE(self);
@@ -671,6 +736,90 @@ store_slot_value(PyObject *self, dc_slot *a, PyObject *value)
     return 0;
 }
 
+static inline void
+store_slot_direct(PyObject *self, Py_ssize_t offset, PyObject *value)
+{
+    PyObject **value_ptr = (PyObject **)((char *)self + offset);
+    PyObject *old_value = *value_ptr;
+    *value_ptr = Py_NewRef(value);
+    Py_XDECREF(old_value);
+}
+
+static int
+slot_store_cache_ready(PyObject *self, dc_cspec *cs)
+{
+#ifdef Py_GIL_DISABLED
+    return 0;
+#else
+    PyTypeObject *tp = Py_TYPE(self);
+    if (tp != cs->owner_type ||
+        cs->frozen)
+    {
+        return 0;
+    }
+    if (!cs->all_slots_ready ||
+        cs->inline_type_version != tp->tp_version_tag)
+    {
+        cs->inline_ready = 0;
+        cs->all_slots_ready = 0;
+        return 0;
+    }
+    return 1;
+#endif
+}
+
+static int
+try_exact_slot_init(PyObject *self, dc_cspec *cs,
+                    PyObject *const *args, Py_ssize_t nargs,
+                    PyObject *kwnames)
+{
+#ifdef Py_GIL_DISABLED
+    return 0;
+#else
+    if (kw_count(kwnames) != 0 || nargs != cs->npos ||
+        cs->nassign != cs->npos || !slot_store_cache_ready(self, cs))
+    {
+        return 0;
+    }
+#define DC_STORE_SLOT_ARG(I) \
+    store_slot_direct(self, cs->assignments[(I)].inline_offset, args[(I)])
+    switch (nargs) {
+        case 0:
+            return 1;
+        case 1:
+            DC_STORE_SLOT_ARG(0);
+            return 1;
+        case 2:
+            DC_STORE_SLOT_ARG(0);
+            DC_STORE_SLOT_ARG(1);
+            return 1;
+        case 3:
+            DC_STORE_SLOT_ARG(0);
+            DC_STORE_SLOT_ARG(1);
+            DC_STORE_SLOT_ARG(2);
+            return 1;
+        case 4:
+            DC_STORE_SLOT_ARG(0);
+            DC_STORE_SLOT_ARG(1);
+            DC_STORE_SLOT_ARG(2);
+            DC_STORE_SLOT_ARG(3);
+            return 1;
+        case 5:
+            DC_STORE_SLOT_ARG(0);
+            DC_STORE_SLOT_ARG(1);
+            DC_STORE_SLOT_ARG(2);
+            DC_STORE_SLOT_ARG(3);
+            DC_STORE_SLOT_ARG(4);
+            return 1;
+    }
+#undef DC_STORE_SLOT_ARG
+    for (Py_ssize_t i = 0; i < nargs; i++) {
+        store_slot_direct(self, cs->assignments[i].inline_offset, args[i]);
+    }
+    return 1;
+#endif
+}
+
 static int
 inline_cache_ready(PyObject *self, dc_cspec *cs)
 {
@@ -687,6 +836,7 @@ inline_cache_ready(PyObject *self, dc_cspec *cs)
         cs->inline_type_version != tp->tp_version_tag)
     {
         cs->inline_ready = 0;
+        cs->all_slots_ready = 0;
         return 0;
     }
     for (Py_ssize_t i = 0; i < cs->nassign; i++) {
@@ -732,6 +882,46 @@ try_no_kw_inline_init(PyObject *self, dc_cspec *cs,
 #ifdef Py_GIL_DISABLED
     return 0;
 #else
+    int exact_slot = try_exact_slot_init(self, cs, args, nargs, kwnames);
+    if (exact_slot != 0) {
+        return exact_slot;
+    }
+
+    if (kw_count(kwnames) == 0 && nargs <= cs->npos &&
+        cs->nassign == cs->npos && slot_store_cache_ready(self, cs))
+    {
+        for (Py_ssize_t i = nargs; i < cs->npos; i++) {
+            if (cs->pos[i].code == 0) {
+                /* Let the regular binder produce the exact TypeError text. */
+                return 0;
+            }
+        }
+
+        for (Py_ssize_t i = 0; i < cs->npos; i++) {
+            dc_slot *p = &cs->pos[i];
+            PyObject *value;
+            int owned = 0;
+            if (i < nargs) {
+                value = args[i];
+            }
+            else if (p->code == 1) {
+                value = p->extra;
+            }
+            else {
+                value = PyObject_CallNoArgs(p->extra);
+                if (value == NULL) {
+                    return -1;
+                }
+                owned = 1;
+            }
+            store_slot_direct(self, cs->assignments[i].inline_offset, value);
+            if (owned) {
+                Py_DECREF(value);
+            }
+        }
+        return 1;
+    }
+
     if (kw_count(kwnames) != 0 || nargs > cs->npos ||
         cs->nassign != cs->npos || !inline_cache_ready(self, cs))
     {
@@ -849,16 +1039,19 @@ update_load_inline_ready(PyObject *self, dc_field_spec *fs)
 #ifndef Py_GIL_DISABLED
     PyTypeObject *tp = Py_TYPE(self);
     fs->inline_ready = 0;
+    fs->all_slots_ready = 0;
     fs->inline_type_version = 0;
     if (tp != fs->owner_type) {
         return;
     }
+    int all_slots = 1;
     for (Py_ssize_t i = 0; i < fs->n; i++) {
         dc_read_slot *r = &fs->fields[i];
         if (r->type_version != tp->tp_version_tag || r->inline_offset < 0) {
             return;
         }
         if (r->load_kind == DC_LOAD_INLINE) {
+            all_slots = 0;
             if (!(tp->tp_flags & Py_TPFLAGS_INLINE_VALUES) ||
                 _PyObject_GetManagedDict(self) != NULL)
             {
@@ -874,7 +1067,50 @@ update_load_inline_ready(PyObject *self, dc_field_spec *fs)
         }
     }
     fs->inline_ready = 1;
+    fs->all_slots_ready = all_slots;
     fs->inline_type_version = tp->tp_version_tag;
+#endif
+}
+
+static void
+precompute_load_slots(dc_field_spec *fs)
+{
+#ifndef Py_GIL_DISABLED
+    PyTypeObject *tp = fs->owner_type;
+    if (tp == NULL) {
+        return;
+    }
+    int all_slots = 1;
+    fs->inline_ready = 0;
+    fs->all_slots_ready = 0;
+    fs->inline_type_version = 0;
+    for (Py_ssize_t i = 0; i < fs->n; i++) {
+        dc_read_slot *r = &fs->fields[i];
+        unsigned int version = 0;
+        PyObject *descr = _PyType_LookupRefAndVersion(tp, r->name, &version);
+        if (version == 0) {
+            Py_XDECREF(descr);
+            all_slots = 0;
+            continue;
+        }
+        Py_ssize_t slot_offset = -1;
+        if (descr != NULL &&
+            member_object_slot_offset_type(tp, descr, &slot_offset))
+        {
+            r->load_kind = DC_LOAD_SLOT;
+            r->type_version = version;
+            r->inline_offset = slot_offset;
+        }
+        else {
+            all_slots = 0;
+        }
+        Py_XDECREF(descr);
+    }
+    if (all_slots) {
+        fs->inline_ready = 1;
+        fs->all_slots_ready = 1;
+        fs->inline_type_version = tp->tp_version_tag;
+    }
 #endif
 }
 
@@ -912,6 +1148,7 @@ refresh_load_cache(PyObject *self, dc_field_spec *fs, dc_read_slot *r)
     r->type_version = 0;
     r->inline_offset = -1;
     fs->inline_ready = 0;
+    fs->all_slots_ready = 0;
     fs->inline_type_version = 0;
 
     PyTypeObject *tp = Py_TYPE(self);
@@ -964,6 +1201,7 @@ field_spec_inline_ready(PyObject *self, dc_field_spec *fs)
         fs->inline_type_version != tp->tp_version_tag)
     {
         fs->inline_ready = 0;
+        fs->all_slots_ready = 0;
         return 0;
     }
     for (Py_ssize_t i = 0; i < fs->n; i++) {
@@ -996,6 +1234,172 @@ load_inline_known(PyObject *self, dc_read_slot *r)
     PyObject **value_ptr = (PyObject **)((char *)self + r->inline_offset);
     return Py_XNewRef(*value_ptr);
 #endif
+}
+
+static inline PyObject *
+load_direct_borrowed(PyObject *self, dc_read_slot *r)
+{
+    PyObject **value_ptr = (PyObject **)((char *)self + r->inline_offset);
+    return *value_ptr;
+}
+
+static int
+field_spec_direct_ready(PyObject *self, PyObject *other, dc_field_spec *fs)
+{
+#ifdef Py_GIL_DISABLED
+    return 0;
+#else
+    PyTypeObject *tp = Py_TYPE(self);
+    if (tp != fs->owner_type || Py_TYPE(other) != tp) {
+        return 0;
+    }
+    if (!fs->inline_ready ||
+        fs->inline_type_version != tp->tp_version_tag)
+    {
+        fs->inline_ready = 0;
+        fs->all_slots_ready = 0;
+        return 0;
+    }
+    if (fs->all_slots_ready) {
+        return 1;
+    }
+    if (!(tp->tp_flags & Py_TPFLAGS_INLINE_VALUES) ||
+        _PyObject_GetManagedDict(self) != NULL ||
+        _PyObject_GetManagedDict(other) != NULL)
+    {
+        return 0;
+    }
+    PyDictValues *self_values = _PyObject_InlineValues(self);
+    PyDictValues *other_values = _PyObject_InlineValues(other);
+    if (!self_values->valid || !other_values->valid) {
+        return 0;
+    }
+    return 1;
+#endif
+}
+
+static int
+richcompare_eq_bool(PyObject *a, PyObject *b)
+{
+    /* RichCompare (not RichCompareBool): the latter short-circuits on
+       identity, which would make a NaN field equal to itself. */
+    PyObject *r = PyObject_RichCompare(a, b, Py_EQ);
+    if (r == NULL) {
+        return -1;
+    }
+    int cmp;
+    if (r == Py_True) {
+        cmp = 1;
+    }
+    else if (r == Py_False) {
+        cmp = 0;
+    }
+    else {
+        cmp = PyObject_IsTrue(r);
+    }
+    Py_DECREF(r);
+    return cmp;
+}
+
+static int
+direct_eq_compare_field(PyObject *self, PyObject *other, dc_read_slot *r,
+                        PyObject **result)
+{
+    PyObject *a = load_direct_borrowed(self, r);
+    PyObject *b = load_direct_borrowed(other, r);
+    if (a == NULL) {
+        a = PyObject_GetAttr(self, r->name);
+        if (a == NULL) {
+            return -1;
+        }
+    }
+    else {
+        Py_INCREF(a);
+    }
+    if (b == NULL) {
+        b = PyObject_GetAttr(other, r->name);
+        if (b == NULL) {
+            Py_DECREF(a);
+            return -1;
+        }
+    }
+    else {
+        Py_INCREF(b);
+    }
+    int cmp = richcompare_eq_bool(a, b);
+    Py_DECREF(a);
+    Py_DECREF(b);
+    if (cmp < 0) {
+        return -1;
+    }
+    if (cmp == 0) {
+        *result = Py_NewRef(Py_False);
+        return 1;
+    }
+    return 2;
+}
+
+static int
+direct_eq_compare(PyObject *self, PyObject *other, dc_field_spec *fs,
+                  PyObject **result)
+{
+    *result = NULL;
+    if (!field_spec_direct_ready(self, other, fs)) {
+        return 0;
+    }
+#define DC_DIRECT_EQ_FIELD(I) \
+    do { \
+        int _res = direct_eq_compare_field(self, other, &fs->fields[(I)], result); \
+        if (_res <= 1) { \
+            return _res; \
+        } \
+    } while (0)
+
+    switch (fs->n) {
+        case 0:
+            *result = Py_NewRef(Py_True);
+            return 1;
+        case 1:
+            DC_DIRECT_EQ_FIELD(0);
+            *result = Py_NewRef(Py_True);
+            return 1;
+        case 2:
+            DC_DIRECT_EQ_FIELD(0);
+            DC_DIRECT_EQ_FIELD(1);
+            *result = Py_NewRef(Py_True);
+            return 1;
+        case 3:
+            DC_DIRECT_EQ_FIELD(0);
+            DC_DIRECT_EQ_FIELD(1);
+            DC_DIRECT_EQ_FIELD(2);
+            *result = Py_NewRef(Py_True);
+            return 1;
+        case 4:
+            DC_DIRECT_EQ_FIELD(0);
+            DC_DIRECT_EQ_FIELD(1);
+            DC_DIRECT_EQ_FIELD(2);
+            DC_DIRECT_EQ_FIELD(3);
+            *result = Py_NewRef(Py_True);
+            return 1;
+        case 5:
+            DC_DIRECT_EQ_FIELD(0);
+            DC_DIRECT_EQ_FIELD(1);
+            DC_DIRECT_EQ_FIELD(2);
+            DC_DIRECT_EQ_FIELD(3);
+            DC_DIRECT_EQ_FIELD(4);
+            *result = Py_NewRef(Py_True);
+            return 1;
+    }
+#undef DC_DIRECT_EQ_FIELD
+
+    for (Py_ssize_t i = 0; i < fs->n; i++) {
+        int res = direct_eq_compare_field(self, other, &fs->fields[i], result);
+        if (res <= 1) {
+            return res;
+        }
+    }
+    *result = Py_NewRef(Py_True);
+    return 1;
 }
 
 static PyObject *
@@ -1070,6 +1474,8 @@ dc_init_impl(PyObject *self, dc_cspec *cs, PyObject *const *args,
             raise_too_many(self, cs->npos, nargs);
             return NULL;
         }
+        int slot_fast = (cs->nassign == cs->npos &&
+                         slot_store_cache_ready(self, cs));
         Py_ssize_t nkw = kw_count(kwnames);
         PyObject *const *kwvalues = args + nargs;
         PyObject **kwbound = NULL;
@@ -1110,7 +1516,13 @@ dc_init_impl(PyObject *self, dc_cspec *cs, PyObject *const *args,
                     continue;
                 }
             }
-            int r = store_attr(self, cs, a, value);
+            int r = 0;
+            if (slot_fast) {
+                store_slot_direct(self, a->inline_offset, value);
+            }
+            else {
+                r = store_attr(self, cs, a, value);
+            }
             if (owned) Py_DECREF(value);
             if (r < 0) goto fast_err;
         }
@@ -1265,63 +1677,62 @@ dc_tp_init(PyObject *self, PyObject *args_tuple, PyObject *kwargs)
     }
 
     PyTypeObject *tp = Py_TYPE(self);
-    PyObject *cap = tp->tp_dict
-        ? PyDict_GetItemWithError(tp->tp_dict, S_c_spec) : NULL;
-    int cap_owned = 0;
-    if (!cap) {
-        if (PyErr_Occurred()) {
-            return -1;
-        }
-        cap = PyObject_GetAttr((PyObject *)tp, S_c_spec);
-        if (!cap) {
-            return -1;
-        }
-        cap_owned = 1;
-    }
-    dc_cspec *cs = (dc_cspec *)PyCapsule_GetPointer(cap, NULL);
-    if (cap_owned) {
-        Py_DECREF(cap);
-    }
+    dc_cspec *cs = type_init_cspec(tp);
     if (cs == NULL) {
         return -1;
     }
 
     Py_ssize_t nargs = PyTuple_GET_SIZE(args_tuple);
     Py_ssize_t nkw = kwargs ? PyDict_GET_SIZE(kwargs) : 0;
-    PyObject **stack = NULL;
     PyObject *kwnames = NULL;
     Py_ssize_t total = nargs + nkw;
-    if (total > 0) {
-        stack = (PyObject **)PyMem_Malloc(total * sizeof(PyObject *));
-        if (stack == NULL) {
-            PyErr_NoMemory();
+    PyObject *empty_stack[1];
+    if (nkw == 0) {
+        PyObject *const *args = nargs ? _PyTuple_ITEMS(args_tuple) : empty_stack;
+        PyObject *res = dc_init_impl(self, cs, args, nargs, NULL);
+        if (res == NULL) {
             return -1;
+        }
+        Py_DECREF(res);
+        return 0;
+    }
+
+    PyObject *small_stack[8];
+    PyObject **stack = small_stack;
+    if (total > 0) {
+        if (total > Py_ARRAY_LENGTH(small_stack)) {
+            stack = (PyObject **)PyMem_Malloc(total * sizeof(PyObject *));
+            if (stack == NULL) {
+                PyErr_NoMemory();
+                return -1;
+            }
         }
     }
     for (Py_ssize_t i = 0; i < nargs; i++) {
         stack[i] = PyTuple_GET_ITEM(args_tuple, i);
     }
-    if (nkw) {
-        kwnames = PyTuple_New(nkw);
-        if (kwnames == NULL) {
+    kwnames = PyTuple_New(nkw);
+    if (kwnames == NULL) {
+        if (stack != small_stack) {
             PyMem_Free(stack);
-            return -1;
         }
-        Py_ssize_t pos = 0;
-        PyObject *key, *value;
-        Py_ssize_t pp = 0;
-        while (PyDict_Next(kwargs, &pp, &key, &value)) {
-            PyTuple_SET_ITEM(kwnames, pos, Py_NewRef(key));
-            stack[nargs + pos] = value;
-            pos++;
-        }
+        return -1;
+    }
+    Py_ssize_t pos = 0;
+    PyObject *key, *value;
+    Py_ssize_t pp = 0;
+    while (PyDict_Next(kwargs, &pp, &key, &value)) {
+        PyTuple_SET_ITEM(kwnames, pos, Py_NewRef(key));
+        stack[nargs + pos] = value;
+        pos++;
     }
 
-    PyObject *empty_stack[1];
     PyObject *res = dc_init_impl(self, cs, total ? stack : empty_stack,
                                  nargs, kwnames);
     Py_XDECREF(kwnames);
-    PyMem_Free(stack);
+    if (stack != small_stack) {
+        PyMem_Free(stack);
+    }
     if (res == NULL) {
         return -1;
     }
@@ -1411,6 +1822,17 @@ dc_eq_impl(PyObject *self, PyObject *other, dc_field_spec *fs)
     if (Py_TYPE(self) != Py_TYPE(other))
         Py_RETURN_NOTIMPLEMENTED;
 
+    if (fs != NULL) {
+        PyObject *direct_result = NULL;
+        int direct_res = direct_eq_compare(self, other, fs, &direct_result);
+        if (direct_res < 0) {
+            return NULL;
+        }
+        if (direct_res > 0) {
+            return direct_result;
+        }
+    }
+
     PyObject *names = fs ? NULL : get_type_attr(self, S_eq_fields);
     if (!fs && !names)
         return NULL;
@@ -1427,12 +1849,9 @@ dc_eq_impl(PyObject *self, PyObject *other, dc_field_spec *fs)
         PyObject *b = fs ? load_field(other, fs, &fs->fields[(I)], fast_other) \
                          : PyObject_GetAttr(other, name); \
         if (!b) { Py_DECREF(a); Py_XDECREF(names); return NULL; } \
-        PyObject *r = PyObject_RichCompare(a, b, Py_EQ); \
+        int cmp = richcompare_eq_bool(a, b); \
         Py_DECREF(a); \
         Py_DECREF(b); \
-        if (!r) { Py_XDECREF(names); return NULL; } \
-        int cmp = PyObject_IsTrue(r); \
-        Py_DECREF(r); \
         if (cmp < 0) { Py_XDECREF(names); return NULL; } \
         if (cmp == 0) { Py_XDECREF(names); Py_RETURN_FALSE; } \
     } while (0)
@@ -1483,14 +1902,9 @@ dc_eq_impl(PyObject *self, PyObject *other, dc_field_spec *fs)
         PyObject *b = fs ? load_field(other, fs, &fs->fields[i], fast_other)
                          : PyObject_GetAttr(other, name);
         if (!b) { Py_DECREF(a); Py_XDECREF(names); return NULL; }
-        /* RichCompare (not RichCompareBool): the latter short-circuits on
-           identity, which would make a NaN field equal to itself. */
-        PyObject *r = PyObject_RichCompare(a, b, Py_EQ);
+        int cmp = richcompare_eq_bool(a, b);
         Py_DECREF(a);
         Py_DECREF(b);
-        if (!r) { Py_XDECREF(names); return NULL; }
-        int cmp = PyObject_IsTrue(r);
-        Py_DECREF(r);
         if (cmp < 0) { Py_XDECREF(names); return NULL; }
         if (cmp == 0) { result = Py_False; break; }
     }
@@ -1640,6 +2054,41 @@ typedef struct {
 
 static PyTypeObject DCMethodDescr_Type;
 
+static dc_cspec *
+type_init_cspec(PyTypeObject *tp)
+{
+    PyObject *init = tp->tp_dict
+        ? PyDict_GetItemWithError(tp->tp_dict, S_init) : NULL;
+    if (init != NULL && Py_IS_TYPE(init, &DCMethodDescr_Type)) {
+        dc_method_descr *descr = (dc_method_descr *)init;
+        if (descr->kind == DC_METHOD_INIT && descr->cs != NULL) {
+            return descr->cs;
+        }
+    }
+    if (init == NULL && PyErr_Occurred()) {
+        return NULL;
+    }
+
+    PyObject *cap = tp->tp_dict
+        ? PyDict_GetItemWithError(tp->tp_dict, S_c_spec) : NULL;
+    int cap_owned = 0;
+    if (cap == NULL) {
+        if (PyErr_Occurred()) {
+            return NULL;
+        }
+        cap = PyObject_GetAttr((PyObject *)tp, S_c_spec);
+        if (cap == NULL) {
+            return NULL;
+        }
+        cap_owned = 1;
+    }
+    dc_cspec *cs = (dc_cspec *)PyCapsule_GetPointer(cap, NULL);
+    if (cap_owned) {
+        Py_DECREF(cap);
+    }
+    return cs;
+}
+
 static PyObject *
 dc_method_arg_error(dc_method_descr *descr, Py_ssize_t nargs,
                     Py_ssize_t expected)
@@ -1676,6 +2125,16 @@ dc_method_vectorcall(PyObject *callable, PyObject *const *args,
 
     switch (descr->kind) {
         case DC_METHOD_INIT:
+            if (descr->cs != NULL && descr->cs->fast) {
+                int done = try_exact_slot_init(self, descr->cs, args + 1,
+                                               nargs - 1, kwnames);
+                if (done > 0) {
+                    Py_RETURN_NONE;
+                }
+                if (done < 0) {
+                    return NULL;
+                }
+            }
             return dc_init_impl(self, descr->cs, args + 1, nargs - 1,
                                 kwnames);
         case DC_METHOD_REPR:
@@ -2004,6 +2463,13 @@ install_tp_init(PyObject *Py_UNUSED(mod), PyObject *cls)
         return NULL;
     }
     PyTypeObject *tp = (PyTypeObject *)cls;
+    dc_cspec *cs = type_init_cspec(tp);
+    if (cs == NULL) {
+        return NULL;
+    }
+    if (cs->all_slots_ready) {
+        Py_RETURN_NONE;
+    }
     tp->tp_init = dc_tp_init;
     PyType_Modified(tp);
     Py_RETURN_NONE;
@@ -2034,6 +2500,7 @@ dc_exec(PyObject *m)
     INTERN(S_repr_fields, "__dataclass_repr_fields__");
     INTERN(S_eq_fields, "__dataclass_eq_fields__");
     INTERN(S_hash_fields, "__dataclass_hash_fields__");
+    INTERN(S_init, "__init__");
     INTERN(S_qualname, "__qualname__");
     INTERN(S_post_init, "__post_init__");
     INTERN(S_pos, "pos");
