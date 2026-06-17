@@ -27,6 +27,7 @@
 #include "structmember.h"
 #include "internal/pycore_dict.h"    // _PyDictValues_AddToInsertionOrder()
 #include "internal/pycore_object.h"  // _PyObject_GetManagedDict()
+#include "internal/pycore_tuple.h"   // tuple hash constants
 
 static PyObject *S_c_spec;
 static PyObject *S_repr_fields;
@@ -737,6 +738,42 @@ try_no_kw_inline_init(PyObject *self, dc_cspec *cs,
         return 0;
     }
 
+    PyDictValues *values = (Py_TYPE(self)->tp_flags & Py_TPFLAGS_INLINE_VALUES)
+        ? _PyObject_InlineValues(self) : NULL;
+    if (nargs == cs->npos) {
+#define DC_STORE_ARG(I) store_direct_known(self, &cs->assignments[(I)], args[(I)], values)
+        switch (nargs) {
+            case 0:
+                return 1;
+            case 1:
+                DC_STORE_ARG(0);
+                return 1;
+            case 2:
+                DC_STORE_ARG(0);
+                DC_STORE_ARG(1);
+                return 1;
+            case 3:
+                DC_STORE_ARG(0);
+                DC_STORE_ARG(1);
+                DC_STORE_ARG(2);
+                return 1;
+            case 4:
+                DC_STORE_ARG(0);
+                DC_STORE_ARG(1);
+                DC_STORE_ARG(2);
+                DC_STORE_ARG(3);
+                return 1;
+            case 5:
+                DC_STORE_ARG(0);
+                DC_STORE_ARG(1);
+                DC_STORE_ARG(2);
+                DC_STORE_ARG(3);
+                DC_STORE_ARG(4);
+                return 1;
+        }
+#undef DC_STORE_ARG
+    }
+
     for (Py_ssize_t i = nargs; i < cs->npos; i++) {
         if (cs->pos[i].code == 0) {
             /* Let the regular binder produce the exact TypeError text. */
@@ -744,8 +781,6 @@ try_no_kw_inline_init(PyObject *self, dc_cspec *cs,
         }
     }
 
-    PyDictValues *values = (Py_TYPE(self)->tp_flags & Py_TPFLAGS_INLINE_VALUES)
-        ? _PyObject_InlineValues(self) : NULL;
     for (Py_ssize_t i = 0; i < cs->npos; i++) {
         dc_slot *p = &cs->pos[i];
         PyObject *value;
@@ -1306,37 +1341,60 @@ dc_repr_impl(PyObject *self, dc_field_spec *fs)
     PyObject *result = NULL;
     PyObject *qual = get_type_attr(self, S_qualname);
     PyObject *names = fs ? NULL : get_type_attr(self, S_repr_fields);
+    PyUnicodeWriter *writer = NULL;
     if (!qual || (!fs && !names))
         goto done;
 
     Py_ssize_t n = fs ? fs->n : PyTuple_GET_SIZE(names);
     int fast = fs ? field_spec_inline_ready(self, fs) : 0;
-    PyObject *parts = PyList_New(n);
-    if (!parts)
-        goto done;
+
+    Py_ssize_t prealloc = PyUnicode_GET_LENGTH(qual) + 2;
     for (Py_ssize_t i = 0; i < n; i++) {
         PyObject *name = fs ? fs->fields[i].name : PyTuple_GET_ITEM(names, i);
+        prealloc += PyUnicode_GET_LENGTH(name) + 4;
+    }
+    writer = PyUnicodeWriter_Create(prealloc);
+    if (writer == NULL) {
+        goto done;
+    }
+    if (PyUnicodeWriter_WriteStr(writer, qual) < 0 ||
+        PyUnicodeWriter_WriteChar(writer, '(') < 0)
+    {
+        goto done;
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *name = fs ? fs->fields[i].name : PyTuple_GET_ITEM(names, i);
+        if (i > 0 &&
+            PyUnicodeWriter_WriteASCII(writer, ", ", 2) < 0)
+        {
+            goto done;
+        }
+        if (PyUnicodeWriter_WriteStr(writer, name) < 0 ||
+            PyUnicodeWriter_WriteChar(writer, '=') < 0)
+        {
+            goto done;
+        }
         PyObject *val = fs ? load_field(self, fs, &fs->fields[i], fast)
                            : PyObject_GetAttr(self, name);
-        if (!val) { Py_DECREF(parts); goto done; }
-        PyObject *r = PyObject_Repr(val);
+        if (!val) {
+            goto done;
+        }
+        int res = PyUnicodeWriter_WriteRepr(writer, val);
         Py_DECREF(val);
-        if (!r) { Py_DECREF(parts); goto done; }
-        PyObject *part = PyUnicode_FromFormat("%U=%U", name, r);
-        Py_DECREF(r);
-        if (!part) { Py_DECREF(parts); goto done; }
-        PyList_SET_ITEM(parts, i, part);
+        if (res < 0) {
+            goto done;
+        }
     }
-    PyObject *sep = PyUnicode_FromString(", ");
-    PyObject *inner = PyUnicode_Join(sep, parts);
-    Py_DECREF(sep);
-    Py_DECREF(parts);
-    if (!inner)
+    if (PyUnicodeWriter_WriteChar(writer, ')') < 0) {
         goto done;
-    result = PyUnicode_FromFormat("%U(%U)", qual, inner);
-    Py_DECREF(inner);
+    }
+    result = PyUnicodeWriter_Finish(writer);
+    writer = NULL;
 
 done:
+    if (writer != NULL) {
+        PyUnicodeWriter_Discard(writer);
+    }
     Py_XDECREF(qual);
     Py_XDECREF(names);
     Py_ReprLeave(self);
@@ -1359,6 +1417,63 @@ dc_eq_impl(PyObject *self, PyObject *other, dc_field_spec *fs)
     Py_ssize_t n = fs ? fs->n : PyTuple_GET_SIZE(names);
     int fast_self = fs ? field_spec_inline_ready(self, fs) : 0;
     int fast_other = fs ? field_spec_inline_ready(other, fs) : 0;
+
+#define DC_EQ_FIELD(I) \
+    do { \
+        PyObject *name = fs ? fs->fields[(I)].name : PyTuple_GET_ITEM(names, (I)); \
+        PyObject *a = fs ? load_field(self, fs, &fs->fields[(I)], fast_self) \
+                         : PyObject_GetAttr(self, name); \
+        if (!a) { Py_XDECREF(names); return NULL; } \
+        PyObject *b = fs ? load_field(other, fs, &fs->fields[(I)], fast_other) \
+                         : PyObject_GetAttr(other, name); \
+        if (!b) { Py_DECREF(a); Py_XDECREF(names); return NULL; } \
+        PyObject *r = PyObject_RichCompare(a, b, Py_EQ); \
+        Py_DECREF(a); \
+        Py_DECREF(b); \
+        if (!r) { Py_XDECREF(names); return NULL; } \
+        int cmp = PyObject_IsTrue(r); \
+        Py_DECREF(r); \
+        if (cmp < 0) { Py_XDECREF(names); return NULL; } \
+        if (cmp == 0) { Py_XDECREF(names); Py_RETURN_FALSE; } \
+    } while (0)
+
+    switch (n) {
+        case 0:
+            Py_XDECREF(names);
+            Py_RETURN_TRUE;
+        case 1:
+            DC_EQ_FIELD(0);
+            Py_XDECREF(names);
+            Py_RETURN_TRUE;
+        case 2:
+            DC_EQ_FIELD(0);
+            DC_EQ_FIELD(1);
+            Py_XDECREF(names);
+            Py_RETURN_TRUE;
+        case 3:
+            DC_EQ_FIELD(0);
+            DC_EQ_FIELD(1);
+            DC_EQ_FIELD(2);
+            Py_XDECREF(names);
+            Py_RETURN_TRUE;
+        case 4:
+            DC_EQ_FIELD(0);
+            DC_EQ_FIELD(1);
+            DC_EQ_FIELD(2);
+            DC_EQ_FIELD(3);
+            Py_XDECREF(names);
+            Py_RETURN_TRUE;
+        case 5:
+            DC_EQ_FIELD(0);
+            DC_EQ_FIELD(1);
+            DC_EQ_FIELD(2);
+            DC_EQ_FIELD(3);
+            DC_EQ_FIELD(4);
+            Py_XDECREF(names);
+            Py_RETURN_TRUE;
+    }
+#undef DC_EQ_FIELD
+
     PyObject *result = Py_True;
     for (Py_ssize_t i = 0; i < n; i++) {
         PyObject *name = fs ? fs->fields[i].name : PyTuple_GET_ITEM(names, i);
@@ -1393,20 +1508,110 @@ dc_hash_impl(PyObject *self, dc_field_spec *fs)
         return NULL;
     Py_ssize_t n = fs ? fs->n : PyTuple_GET_SIZE(names);
     int fast = fs ? field_spec_inline_ready(self, fs) : 0;
-    PyObject *t = PyTuple_New(n);
-    if (!t) { Py_XDECREF(names); return NULL; }
+
+    PyObject *small_items[8];
+    PyObject **items = small_items;
+    if (n > Py_ARRAY_LENGTH(small_items)) {
+        if (n > PY_SSIZE_T_MAX / (Py_ssize_t)sizeof(PyObject *)) {
+            PyErr_NoMemory();
+            Py_XDECREF(names);
+            return NULL;
+        }
+        items = (PyObject **)PyMem_Malloc(n * sizeof(PyObject *));
+        if (items == NULL) {
+            PyErr_NoMemory();
+            Py_XDECREF(names);
+            return NULL;
+        }
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+        items[i] = NULL;
+    }
+
     for (Py_ssize_t i = 0; i < n; i++) {
         PyObject *v = fs ? load_field(self, fs, &fs->fields[i], fast)
                          : PyObject_GetAttr(self, PyTuple_GET_ITEM(names, i));
-        if (!v) { Py_DECREF(t); Py_XDECREF(names); return NULL; }
-        PyTuple_SET_ITEM(t, i, v);
+        if (!v) {
+            goto error;
+        }
+        items[i] = v;
     }
     Py_XDECREF(names);
-    Py_hash_t h = PyObject_Hash(t);
-    Py_DECREF(t);
-    if (h == -1)
-        return NULL;
-    return PyLong_FromSsize_t(h);
+
+    Py_uhash_t acc = _PyTuple_HASH_XXPRIME_5;
+#define DC_HASH_ITEM(I) \
+    do { \
+        Py_uhash_t lane = PyObject_Hash(items[(I)]); \
+        if (lane == (Py_uhash_t)-1) { \
+            goto error_no_names; \
+        } \
+        acc += lane * _PyTuple_HASH_XXPRIME_2; \
+        acc = _PyTuple_HASH_XXROTATE(acc); \
+        acc *= _PyTuple_HASH_XXPRIME_1; \
+    } while (0)
+
+    switch (n) {
+        case 0:
+            break;
+        case 1:
+            DC_HASH_ITEM(0);
+            break;
+        case 2:
+            DC_HASH_ITEM(0);
+            DC_HASH_ITEM(1);
+            break;
+        case 3:
+            DC_HASH_ITEM(0);
+            DC_HASH_ITEM(1);
+            DC_HASH_ITEM(2);
+            break;
+        case 4:
+            DC_HASH_ITEM(0);
+            DC_HASH_ITEM(1);
+            DC_HASH_ITEM(2);
+            DC_HASH_ITEM(3);
+            break;
+        case 5:
+            DC_HASH_ITEM(0);
+            DC_HASH_ITEM(1);
+            DC_HASH_ITEM(2);
+            DC_HASH_ITEM(3);
+            DC_HASH_ITEM(4);
+            break;
+        default:
+            for (Py_ssize_t i = 0; i < n; i++) {
+                DC_HASH_ITEM(i);
+            }
+            break;
+    }
+#undef DC_HASH_ITEM
+
+    acc += n ^ (_PyTuple_HASH_XXPRIME_5 ^ 3527539UL);
+    if (acc == (Py_uhash_t)-1) {
+        acc = 1546275796;
+    }
+
+    for (Py_ssize_t i = 0; i < n; i++) {
+        Py_DECREF(items[i]);
+    }
+    if (items != small_items) {
+        PyMem_Free(items);
+    }
+    return PyLong_FromSsize_t((Py_hash_t)acc);
+
+error:
+    Py_XDECREF(names);
+error_no_names:
+    for (Py_ssize_t i = 0; i < n; i++) {
+        Py_XDECREF(items[i]);
+    }
+    if (items != small_items) {
+        PyMem_Free(items);
+    }
+    if (!PyErr_Occurred()) {
+        PyErr_SetString(PyExc_RuntimeError, "dataclass hash failed");
+    }
+    return NULL;
 }
 
 /* ----------------------------- module ------------------------------- */
@@ -1429,6 +1634,8 @@ typedef struct {
     PyObject *qualname;
     PyObject *annotate;
     PyObject *wrapped;
+    PyObject *metadata_builder;
+    PyObject *metadata_cls;
 } dc_method_descr;
 
 static PyTypeObject DCMethodDescr_Type;
@@ -1520,6 +1727,8 @@ dc_method_traverse(PyObject *self, visitproc visit, void *arg)
     Py_VISIT(descr->qualname);
     Py_VISIT(descr->annotate);
     Py_VISIT(descr->wrapped);
+    Py_VISIT(descr->metadata_builder);
+    Py_VISIT(descr->metadata_cls);
     return 0;
 }
 
@@ -1535,6 +1744,8 @@ dc_method_clear(PyObject *self)
     Py_CLEAR(descr->qualname);
     Py_CLEAR(descr->annotate);
     Py_CLEAR(descr->wrapped);
+    Py_CLEAR(descr->metadata_builder);
+    Py_CLEAR(descr->metadata_cls);
     return 0;
 }
 
@@ -1558,8 +1769,62 @@ dc_method_repr(PyObject *self)
 static PyMemberDef dc_method_members[] = {
     {"__name__", Py_T_OBJECT_EX, DC_MD_OFF(name), Py_READONLY, NULL},
     {"__qualname__", Py_T_OBJECT_EX, DC_MD_OFF(qualname), Py_READONLY, NULL},
-    {"__annotate__", Py_T_OBJECT_EX, DC_MD_OFF(annotate), Py_READONLY, NULL},
-    {"__wrapped__", Py_T_OBJECT_EX, DC_MD_OFF(wrapped), Py_READONLY, NULL},
+    {NULL}
+};
+
+static int
+dc_method_ensure_metadata(dc_method_descr *descr)
+{
+    if (descr->annotate != NULL && descr->wrapped != NULL) {
+        return 0;
+    }
+    if (descr->metadata_builder == NULL || descr->metadata_cls == NULL) {
+        PyErr_SetString(PyExc_AttributeError,
+                        "dataclass method has no init metadata");
+        return -1;
+    }
+    PyObject *metadata = PyObject_CallOneArg(descr->metadata_builder,
+                                             descr->metadata_cls);
+    if (metadata == NULL) {
+        return -1;
+    }
+    if (!PyTuple_Check(metadata) || PyTuple_GET_SIZE(metadata) != 2) {
+        PyErr_SetString(PyExc_TypeError,
+                        "dataclass metadata factory must return a 2-tuple");
+        Py_DECREF(metadata);
+        return -1;
+    }
+    PyObject *annotate = PyTuple_GET_ITEM(metadata, 0);
+    PyObject *wrapped = PyTuple_GET_ITEM(metadata, 1);
+    Py_XSETREF(descr->annotate, Py_NewRef(annotate));
+    Py_XSETREF(descr->wrapped, Py_NewRef(wrapped));
+    Py_DECREF(metadata);
+    return 0;
+}
+
+static PyObject *
+dc_method_get_annotate(PyObject *self, void *Py_UNUSED(closure))
+{
+    dc_method_descr *descr = (dc_method_descr *)self;
+    if (descr->annotate == NULL && dc_method_ensure_metadata(descr) < 0) {
+        return NULL;
+    }
+    return Py_NewRef(descr->annotate);
+}
+
+static PyObject *
+dc_method_get_wrapped(PyObject *self, void *Py_UNUSED(closure))
+{
+    dc_method_descr *descr = (dc_method_descr *)self;
+    if (descr->wrapped == NULL && dc_method_ensure_metadata(descr) < 0) {
+        return NULL;
+    }
+    return Py_NewRef(descr->wrapped);
+}
+
+static PyGetSetDef dc_method_getsets[] = {
+    {"__annotate__", dc_method_get_annotate, NULL, NULL, NULL},
+    {"__wrapped__", dc_method_get_wrapped, NULL, NULL, NULL},
     {NULL}
 };
 
@@ -1579,6 +1844,7 @@ static PyTypeObject DCMethodDescr_Type = {
                 Py_TPFLAGS_HAVE_VECTORCALL,
     .tp_descr_get = dc_method_descr_get,
     .tp_members = dc_method_members,
+    .tp_getset = dc_method_getsets,
     .tp_free = PyObject_GC_Del,
 };
 
@@ -1600,7 +1866,8 @@ method_qualname(PyObject *cls, const char *name)
 static PyObject *
 make_method_descr(const char *name, dc_method_kind kind,
                   PyObject *capsule, dc_field_spec *field_spec,
-                  PyObject *cls, PyObject *annotate, PyObject *wrapped)
+                  PyObject *cls, PyObject *annotate, PyObject *wrapped,
+                  PyObject *metadata_builder)
 {
     dc_method_descr *descr = PyObject_GC_New(dc_method_descr,
                                              &DCMethodDescr_Type);
@@ -1616,6 +1883,8 @@ make_method_descr(const char *name, dc_method_kind kind,
     descr->field_spec = field_spec;
     descr->annotate = Py_XNewRef(annotate);
     descr->wrapped = Py_XNewRef(wrapped);
+    descr->metadata_builder = Py_XNewRef(metadata_builder);
+    descr->metadata_cls = metadata_builder != NULL ? Py_XNewRef(cls) : NULL;
     PyObject_GC_Track(descr);
     if (capsule != NULL) {
         descr->cs = (dc_cspec *)PyCapsule_GetPointer(capsule, NULL);
@@ -1642,7 +1911,7 @@ add_method_descr(PyObject *m, const char *attr,
                  const char *method_name, dc_method_kind kind)
 {
     PyObject *o = make_method_descr(method_name, kind, NULL, NULL,
-                                    NULL, NULL, NULL);
+                                    NULL, NULL, NULL, NULL);
     if (!o)
         return -1;
     int r = PyModule_AddObjectRef(m, attr, o);
@@ -1654,27 +1923,38 @@ static PyObject *
 make_init_descr(PyObject *Py_UNUSED(mod), PyObject *const *args,
                 Py_ssize_t nargs)
 {
-    if (nargs != 1 && nargs != 4) {
+    if (nargs != 1 && nargs != 3 && nargs != 4) {
         PyErr_Format(PyExc_TypeError,
-                     "make_init() takes 1 or 4 arguments (%zd given)",
+                     "make_init() takes 1, 3 or 4 arguments (%zd given)",
                      nargs);
         return NULL;
     }
     PyObject *cls = NULL;
     PyObject *annotate = NULL;
     PyObject *wrapped = NULL;
-    if (nargs == 4) {
+    PyObject *metadata_builder = NULL;
+    if (nargs >= 3) {
         cls = args[1];
         if (!PyType_Check(cls)) {
             PyErr_SetString(PyExc_TypeError,
                             "make_init() argument 2 must be a type");
             return NULL;
         }
-        annotate = args[2];
-        wrapped = args[3];
+        if (nargs == 3) {
+            metadata_builder = args[2];
+            if (!PyCallable_Check(metadata_builder)) {
+                PyErr_SetString(PyExc_TypeError,
+                                "make_init() argument 3 must be callable");
+                return NULL;
+            }
+        }
+        else {
+            annotate = args[2];
+            wrapped = args[3];
+        }
     }
     return make_method_descr("__init__", DC_METHOD_INIT, args[0], NULL,
-                             cls, annotate, wrapped);
+                             cls, annotate, wrapped, metadata_builder);
 }
 
 static PyObject *
@@ -1691,7 +1971,7 @@ make_field_method_descr(PyObject *const *args, Py_ssize_t nargs,
     if (fs == NULL) {
         return NULL;
     }
-    return make_method_descr(name, kind, NULL, fs, args[1], NULL, NULL);
+    return make_method_descr(name, kind, NULL, fs, args[1], NULL, NULL, NULL);
 }
 
 static PyObject *

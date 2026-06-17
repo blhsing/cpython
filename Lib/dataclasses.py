@@ -1389,14 +1389,9 @@ def _install_generic_methods(cls, fields, all_init_fields, std_init_fields,
             # then a tight C loop -- no per-call attribute/PyLong work.
             c_spec = _c_accel.make_cspec(spec, cls)
             cls.__dataclass_c_spec__ = c_spec
-            annotation_fields = [f.name for f in all_init_fields if f.init]
-            init_annotate = _make_annotate_function(
-                cls, '__init__', annotation_fields, None)
-            init_wrapped = _GenericInitSignature(cls)
             if not _set_new_attribute(cls, '__init__',
                                       _c_accel.make_init(
-                                          c_spec, cls, init_annotate,
-                                          init_wrapped)):
+                                          c_spec, cls, _c_init_metadata)):
                 _c_accel.install_tp_init(cls)
         else:
             init_fn = _generic_method(_dataclass_generic_init, cls, '__init__')
@@ -1452,9 +1447,8 @@ def _rebind_c_methods(cls):
     if type(cls.__dict__.get('__init__')) is method_type:
         c_spec = _c_accel.make_cspec(cls.__dataclass_init_spec__, cls)
         cls.__dataclass_c_spec__ = c_spec
-        init_annotate, init_wrapped = _c_init_metadata(cls)
         cls.__init__ = _c_accel.make_init(
-            c_spec, cls, init_annotate, init_wrapped)
+            c_spec, cls, _c_init_metadata)
         _c_accel.install_tp_init(cls)
     if type(cls.__dict__.get('__repr__')) is method_type:
         cls.__repr__ = _c_accel.make_repr(cls.__dataclass_repr_fields__, cls)
