@@ -27,7 +27,7 @@ import typing       # Needed for the string "typing.ClassVar[int]" to work as an
 import dataclasses  # Needed for the string "dataclasses.InitVar[int]" to work as an annotation.
 
 from test import support
-from test.support import cpython_only, import_helper
+from test.support import cpython_only, import_helper, script_helper
 
 # Just any custom exception we can catch.
 class CustomError(Exception): pass
@@ -117,7 +117,7 @@ class TestCase(unittest.TestCase):
         expected_output = "_DataclassParams(init=True,repr=True," \
                           "eq=True,order=False,unsafe_hash=False,frozen=True," \
                           "match_args=True,kw_only=False," \
-                          "slots=True,weakref_slot=False,c_accel=None)"
+                          "slots=True,weakref_slot=False,fast_build=False)"
         self.assertEqual(repr_output, expected_output)
 
     def test_dataclass_params_signature(self):
@@ -133,44 +133,61 @@ class TestCase(unittest.TestCase):
             self.assertHasAttr(Some.__dataclass_params__, param)
 
     @cpython_only
-    def test_c_accel_flag(self):
-        c_accel = import_helper.import_module('_dataclasses')
-        method_type = type(c_accel.init)
+    def test_fast_build_flag(self):
+        accel = import_helper.import_module('_dataclasses')
+        method_type = type(accel.init)
 
-        @dataclass(c_accel=True)
+        @dataclass(fast_build=True)
         class Accelerated:
             x: int
 
-        @dataclass(c_accel=False)
+        @dataclass(fast_build=False)
         class Generated:
             x: int
 
         self.assertIs(type(Accelerated.__dict__['__init__']), method_type)
         self.assertIsNot(type(Generated.__dict__['__init__']), method_type)
         self.assertEqual(Accelerated(1).x, Generated(1).x)
-        self.assertIs(Accelerated.__dataclass_params__.c_accel, True)
-        self.assertIs(Generated.__dataclass_params__.c_accel, False)
+        self.assertIs(Accelerated.__dataclass_params__.fast_build, True)
+        self.assertIs(Generated.__dataclass_params__.fast_build, False)
 
     @cpython_only
-    def test_make_dataclass_c_accel_flag(self):
-        c_accel = import_helper.import_module('_dataclasses')
-        method_type = type(c_accel.init)
+    def test_make_dataclass_fast_build_flag(self):
+        accel = import_helper.import_module('_dataclasses')
+        method_type = type(accel.init)
 
-        C = make_dataclass('C', ['x'], c_accel=True)
+        C = make_dataclass('C', ['x'], fast_build=True)
         self.assertIs(type(C.__dict__['__init__']), method_type)
         self.assertEqual(C(1).x, 1)
 
     @cpython_only
-    def test_slots_c_accel_flag(self):
-        c_accel = import_helper.import_module('_dataclasses')
-        method_type = type(c_accel.init)
+    def test_slots_fast_build_flag(self):
+        accel = import_helper.import_module('_dataclasses')
+        method_type = type(accel.init)
 
-        @dataclass(slots=True, c_accel=True)
+        @dataclass(slots=True, fast_build=True)
         class C:
             x: int
 
         self.assertIs(type(C.__dict__['__init__']), method_type)
         self.assertEqual(C(1).x, 1)
+
+    @cpython_only
+    def test_dataclasses_generic_env_ignored(self):
+        script = textwrap.dedent('''
+            from dataclasses import dataclass
+            import _dataclasses
+
+            @dataclass
+            class C:
+                x: int
+
+            print(type(C.__dict__['__init__']) is type(_dataclasses.init))
+        ''')
+        res = script_helper.assert_python_ok(
+            '-c', script, DATACLASSES_GENERIC='c')
+        self.assertEqual(res.out.strip(), b'False')
+        self.assertEqual(res.err, b'')
 
     def test_named_init_params(self):
         @dataclass
