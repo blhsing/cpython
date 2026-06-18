@@ -173,6 +173,125 @@ class TestCase(unittest.TestCase):
         self.assertEqual(C(1).x, 1)
 
     @cpython_only
+    def test_fast_build_init_defaults_factories_and_kw_only(self):
+        accel = import_helper.import_module('_dataclasses')
+        method_type = type(accel.init)
+
+        @dataclass(fast_build=True)
+        class C:
+            x: int
+            y: int = 2
+            z: list = field(default_factory=list)
+            _: KW_ONLY
+            k: int
+            hidden: int = field(init=False, default_factory=lambda: 9)
+
+        self.assertIs(type(C.__dict__['__init__']), method_type)
+        c = C(1, k=4)
+        self.assertEqual((c.x, c.y, c.z, c.k, c.hidden),
+                         (1, 2, [], 4, 9))
+        self.assertEqual(
+            repr(c),
+            f"{C.__qualname__}(x=1, y=2, z=[], k=4, hidden=9)")
+
+        other = C(1, k=4)
+        self.assertIsNot(c.z, other.z)
+        self.assertEqual(C(1, 3, [5], k=4).z, [5])
+
+    @cpython_only
+    def test_fast_build_initvar_and_post_init(self):
+        accel = import_helper.import_module('_dataclasses')
+        method_type = type(accel.init)
+
+        @dataclass(fast_build=True)
+        class C:
+            x: int
+            scale: InitVar[int]
+            y: int = field(init=False)
+
+            def __post_init__(self, scale):
+                self.y = self.x * scale
+
+        self.assertIs(type(C.__dict__['__init__']), method_type)
+        c = C(4, 3)
+        self.assertEqual((c.x, c.y), (4, 12))
+        self.assertNotHasAttr(c, 'scale')
+
+    @cpython_only
+    def test_fast_build_repr_eq_hash_field_options(self):
+        accel = import_helper.import_module('_dataclasses')
+        method_type = type(accel.init)
+
+        @dataclass(frozen=True, fast_build=True)
+        class C:
+            x: int
+            y: int = field(default=0, repr=False, compare=False, hash=False)
+            z: int = 1
+
+        for name in ('__repr__', '__eq__', '__hash__'):
+            self.assertIs(type(C.__dict__[name]), method_type)
+
+        c = C(1, 2, 3)
+        self.assertEqual(repr(c), f"{C.__qualname__}(x=1, z=3)")
+        self.assertEqual(c, C(1, 99, 3))
+        self.assertNotEqual(c, C(1, 2, 4))
+        self.assertIs(c.__eq__(object()), NotImplemented)
+        self.assertEqual(hash(c), hash((1, 3)))
+
+    @cpython_only
+    def test_fast_build_slots_and_frozen(self):
+        accel = import_helper.import_module('_dataclasses')
+        method_type = type(accel.init)
+
+        @dataclass(slots=True, frozen=True, fast_build=True)
+        class C:
+            x: int
+            y: int = field(init=False, default=4)
+
+        self.assertIs(type(C.__dict__['__init__']), method_type)
+        c = C(1)
+        self.assertEqual((c.x, c.y), (1, 4))
+        self.assertNotHasAttr(c, '__dict__')
+        with self.assertRaises(FrozenInstanceError):
+            c.x = 2
+        with self.assertRaises(FrozenInstanceError):
+            del c.y
+
+    @cpython_only
+    def test_fast_build_ordering(self):
+        @dataclass(order=True, fast_build=True)
+        class C:
+            x: int
+            y: int = field(compare=False)
+
+        self.assertLess(C(1, 10), C(2, 0))
+        self.assertLessEqual(C(1, 10), C(1, 0))
+        self.assertGreater(C(2, 0), C(1, 10))
+        self.assertNotEqual(C(1, 10), C(2, 10))
+        self.assertEqual(C(1, 10), C(1, 0))
+
+    @cpython_only
+    def test_fast_build_respects_existing_methods(self):
+        accel = import_helper.import_module('_dataclasses')
+        method_type = type(accel.init)
+
+        @dataclass(fast_build=True)
+        class C:
+            x: int
+
+            def __init__(self, x):
+                self.x = x + 1
+
+            def __repr__(self):
+                return f"custom {self.x}"
+
+        self.assertIsNot(type(C.__dict__['__init__']), method_type)
+        self.assertIsNot(type(C.__dict__['__repr__']), method_type)
+        c = C(1)
+        self.assertEqual(c.x, 2)
+        self.assertEqual(repr(c), "custom 2")
+
+    @cpython_only
     def test_dataclasses_generic_env_ignored(self):
         script = textwrap.dedent('''
             from dataclasses import dataclass
