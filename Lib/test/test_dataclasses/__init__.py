@@ -176,17 +176,17 @@ class TestCase(unittest.TestCase):
     def test_dataclasses_generic_env_ignored(self):
         script = textwrap.dedent('''
             from dataclasses import dataclass
-            import _dataclasses
+            import types
 
             @dataclass
             class C:
                 x: int
 
-            print(type(C.__dict__['__init__']) is type(_dataclasses.init))
+            print(isinstance(C.__dict__['__init__'], types.FunctionType))
         ''')
         res = script_helper.assert_python_ok(
             '-c', script, DATACLASSES_GENERIC='c')
-        self.assertEqual(res.out.strip(), b'False')
+        self.assertEqual(res.out.strip(), b'True')
         self.assertEqual(res.err, b'')
 
     def test_named_init_params(self):

@@ -29,6 +29,7 @@ static const char* _Py_stdlib_module_names[] = {
 "_ctypes",
 "_curses",
 "_curses_panel",
+"_dataclasses",
 "_datetime",
 "_dbm",
 "_decimal",
