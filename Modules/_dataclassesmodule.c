@@ -820,12 +820,10 @@ try_exact_slot_init(PyObject *self, dc_cspec *cs,
 #endif
 }
 
+#ifndef Py_GIL_DISABLED
 static int
 inline_cache_ready(PyObject *self, dc_cspec *cs)
 {
-#ifdef Py_GIL_DISABLED
-    return 0;
-#else
     PyTypeObject *tp = Py_TYPE(self);
     if (tp != cs->owner_type ||
         cs->frozen)
@@ -851,7 +849,6 @@ inline_cache_ready(PyObject *self, dc_cspec *cs)
         }
     }
     return 1;
-#endif
 }
 
 static void
@@ -873,6 +870,7 @@ store_direct_known(PyObject *self, dc_slot *a, PyObject *value,
         Py_DECREF(old_value);
     }
 }
+#endif
 
 static int
 try_no_kw_inline_init(PyObject *self, dc_cspec *cs,
