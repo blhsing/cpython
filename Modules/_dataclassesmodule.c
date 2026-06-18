@@ -1700,7 +1700,7 @@ dc_tp_init(PyObject *self, PyObject *args_tuple, PyObject *kwargs)
     PyObject *small_stack[8];
     PyObject **stack = small_stack;
     if (total > 0) {
-        if (total > Py_ARRAY_LENGTH(small_stack)) {
+        if (total > (Py_ssize_t)Py_ARRAY_LENGTH(small_stack)) {
             stack = (PyObject **)PyMem_Malloc(total * sizeof(PyObject *));
             if (stack == NULL) {
                 PyErr_NoMemory();
@@ -1925,7 +1925,7 @@ dc_hash_impl(PyObject *self, dc_field_spec *fs)
 
     PyObject *small_items[8];
     PyObject **items = small_items;
-    if (n > Py_ARRAY_LENGTH(small_items)) {
+    if (n > (Py_ssize_t)Py_ARRAY_LENGTH(small_items)) {
         if (n > PY_SSIZE_T_MAX / (Py_ssize_t)sizeof(PyObject *)) {
             PyErr_NoMemory();
             Py_XDECREF(names);
@@ -2523,6 +2523,7 @@ dc_exec(PyObject *m)
 static PyModuleDef_Slot dc_slots[] = {
     {Py_mod_exec, dc_exec},
     {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_SUPPORTED},
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
     {0, NULL}
 };
 
