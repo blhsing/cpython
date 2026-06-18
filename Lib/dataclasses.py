@@ -347,11 +347,12 @@ class _DataclassParams:
                  'kw_only',
                  'slots',
                  'weakref_slot',
+                 'c_accel',
                  )
 
     def __init__(self,
                  init, repr, eq, order, unsafe_hash, frozen,
-                 match_args, kw_only, slots, weakref_slot):
+                 match_args, kw_only, slots, weakref_slot, c_accel):
         self.init = init
         self.repr = repr
         self.eq = eq
@@ -362,6 +363,7 @@ class _DataclassParams:
         self.kw_only = kw_only
         self.slots = slots
         self.weakref_slot = weakref_slot
+        self.c_accel = c_accel
 
     def __repr__(self):
         return ('_DataclassParams('
@@ -374,7 +376,8 @@ class _DataclassParams:
                 f'match_args={self.match_args!r},'
                 f'kw_only={self.kw_only!r},'
                 f'slots={self.slots!r},'
-                f'weakref_slot={self.weakref_slot!r}'
+                f'weakref_slot={self.weakref_slot!r},'
+                f'c_accel={self.c_accel!r}'
                 ')')
 
 
@@ -1032,6 +1035,27 @@ _c_accel = None
 if _GENERIC_MODE == 'c':
     import _dataclasses as _c_accel
 
+
+def _get_c_accel():
+    global _c_accel
+    if _c_accel is None:
+        import _dataclasses as _c_accel
+    return _c_accel
+
+
+def _use_c_accel(c_accel):
+    if c_accel is None:
+        return _GENERIC_MODE == 'c'
+    return bool(c_accel)
+
+
+def _use_generic_methods(c_accel, use_c):
+    if use_c:
+        return True
+    if c_accel is False and _GENERIC_MODE == 'c':
+        return False
+    return _USE_GENERIC_METHODS and _GENERIC_MODE != 'c'
+
 # Parameter kinds for the init spec.
 _GEN_REQUIRED = 0
 _GEN_DEFAULT = 1
@@ -1377,8 +1401,8 @@ def _install_generic_init_signature(cls):
 def _install_generic_methods(cls, fields, all_init_fields, std_init_fields,
                              kw_only_init_fields, field_list, init, repr_, eq,
                              order, frozen, has_post_init, slots,
-                             unsafe_hash, has_explicit_hash):
-    use_c = _GENERIC_MODE == 'c'
+                             unsafe_hash, has_explicit_hash, use_c):
+    c_accel = _get_c_accel() if use_c else None
     if init:
         spec = _make_init_spec(
             all_init_fields, std_init_fields, kw_only_init_fields,
@@ -1387,12 +1411,12 @@ def _install_generic_methods(cls, fields, all_init_fields, std_init_fields,
         if use_c:
             # Cache a C-native view of the spec so dc_init reads one capsule
             # then a tight C loop -- no per-call attribute/PyLong work.
-            c_spec = _c_accel.make_cspec(spec, cls)
+            c_spec = c_accel.make_cspec(spec, cls)
             cls.__dataclass_c_spec__ = c_spec
             if not _set_new_attribute(cls, '__init__',
-                                      _c_accel.make_init(
+                                      c_accel.make_init(
                                           c_spec, cls, _c_init_metadata)):
-                _c_accel.install_tp_init(cls)
+                c_accel.install_tp_init(cls)
         else:
             init_fn = _generic_method(_dataclass_generic_init, cls, '__init__')
             if _GENERIC_MODE != 'shared':
@@ -1407,14 +1431,14 @@ def _install_generic_methods(cls, fields, all_init_fields, std_init_fields,
         cls.__dataclass_repr_fields__ = repr_fields = tuple(
             f.name for f in field_list if f.repr)
         _set_new_attribute(cls, '__repr__',
-                           _c_accel.make_repr(repr_fields, cls) if use_c else
+                           c_accel.make_repr(repr_fields, cls) if use_c else
                            _generic_method(_dataclass_generic_repr, cls,
                                            '__repr__'))
     if eq:
         cls.__dataclass_eq_fields__ = eq_fields = tuple(
             f.name for f in field_list if f.compare)
         _set_new_attribute(cls, '__eq__',
-                           _c_accel.make_eq(eq_fields, cls) if use_c else
+                           c_accel.make_eq(eq_fields, cls) if use_c else
                            _generic_method(_dataclass_generic_eq, cls,
                                            '__eq__'))
     # Hash, mirroring the _hash_action table decision.
@@ -1426,7 +1450,7 @@ def _install_generic_methods(cls, fields, all_init_fields, std_init_fields,
         flds = [f for f in field_list
                 if (f.compare if f.hash is None else f.hash)]
         cls.__dataclass_hash_fields__ = hash_fields = tuple(f.name for f in flds)
-        cls.__hash__ = (_c_accel.make_hash(hash_fields, cls) if use_c else
+        cls.__hash__ = (c_accel.make_hash(hash_fields, cls) if use_c else
                         _generic_method(_dataclass_generic_hash, cls,
                                         '__hash__'))
     elif hash_action is _hash_exception:
@@ -1443,23 +1467,24 @@ def _c_init_metadata(cls):
 
 
 def _rebind_c_methods(cls):
-    method_type = type(_c_accel.init)
+    c_accel = _get_c_accel()
+    method_type = type(c_accel.init)
     if type(cls.__dict__.get('__init__')) is method_type:
-        c_spec = _c_accel.make_cspec(cls.__dataclass_init_spec__, cls)
+        c_spec = c_accel.make_cspec(cls.__dataclass_init_spec__, cls)
         cls.__dataclass_c_spec__ = c_spec
-        cls.__init__ = _c_accel.make_init(
+        cls.__init__ = c_accel.make_init(
             c_spec, cls, _c_init_metadata)
-        _c_accel.install_tp_init(cls)
+        c_accel.install_tp_init(cls)
     if type(cls.__dict__.get('__repr__')) is method_type:
-        cls.__repr__ = _c_accel.make_repr(cls.__dataclass_repr_fields__, cls)
+        cls.__repr__ = c_accel.make_repr(cls.__dataclass_repr_fields__, cls)
     if type(cls.__dict__.get('__eq__')) is method_type:
-        cls.__eq__ = _c_accel.make_eq(cls.__dataclass_eq_fields__, cls)
+        cls.__eq__ = c_accel.make_eq(cls.__dataclass_eq_fields__, cls)
     if type(cls.__dict__.get('__hash__')) is method_type:
-        cls.__hash__ = _c_accel.make_hash(cls.__dataclass_hash_fields__, cls)
+        cls.__hash__ = c_accel.make_hash(cls.__dataclass_hash_fields__, cls)
 
 
 def _discard_c_methods(cls):
-    method_type = type(_c_accel.init)
+    method_type = type(_get_c_accel().init)
     for name in ('__init__', '__repr__', '__eq__', '__hash__'):
         if type(cls.__dict__.get(name)) is method_type:
             delattr(cls, name)
@@ -1468,7 +1493,7 @@ def _discard_c_methods(cls):
 
 
 def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
-                   match_args, kw_only, slots, weakref_slot):
+                   match_args, kw_only, slots, weakref_slot, c_accel):
     # Now that dicts retain insertion order, there's no reason to use
     # an ordered dict.  I am leveraging that ordering here, because
     # derived class fields overwrite base class fields, but the order
@@ -1488,7 +1513,11 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
     setattr(cls, _PARAMS, _DataclassParams(init, repr, eq, order,
                                            unsafe_hash, frozen,
                                            match_args, kw_only,
-                                           slots, weakref_slot))
+                                           slots, weakref_slot,
+                                           c_accel))
+
+    use_c = _use_c_accel(c_accel)
+    use_generic_methods = _use_generic_methods(c_accel, use_c)
 
     # Find our base classes in reverse MRO order, and exclude
     # ourselves.  In reversed order so that more derived classes
@@ -1621,13 +1650,14 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
     # used in all of the following methods.
     field_list = [f for f in fields.values() if f._field_type is _FIELD]
 
-    if _USE_GENERIC_METHODS:
+    if use_generic_methods:
         # Install shared, metadata-driven __init__/__repr__/__eq__/__hash__
         # instead of generating and compiling per-class source.
         _install_generic_methods(
             cls, fields, all_init_fields, std_init_fields,
             kw_only_init_fields, field_list, init, repr, eq, order,
-            frozen, has_post_init, slots, unsafe_hash, has_explicit_hash)
+            frozen, has_post_init, slots, unsafe_hash, has_explicit_hash,
+            use_c)
         _set_new_attribute(cls, '__replace__', _replace)
     else:
         if init:
@@ -1693,12 +1723,12 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
                             overwrite_error='Consider using functools.total_ordering')
 
     if frozen:
-        if _USE_GENERIC_METHODS:
+        if use_generic_methods:
             _install_frozen_set_del(cls, field_list)
         else:
             _frozen_set_del_attr(cls, field_list, func_builder)
 
-    if not _USE_GENERIC_METHODS:
+    if not use_generic_methods:
         # Decide if/how we're going to create a hash function.  (Generic
         # mode makes this decision inside _install_generic_methods.)
         hash_action = _hash_action[bool(unsafe_hash),
@@ -1727,11 +1757,11 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
     if slots:
         oldcls = cls
         cls = _add_slots(cls, frozen, weakref_slot, fields)
-        if _GENERIC_MODE == 'c':
+        if use_c:
             _rebind_c_methods(cls)
             _discard_c_methods(oldcls)
 
-    if _USE_GENERIC_METHODS and init:
+    if use_generic_methods and init:
         # Done after _add_slots so ForwardRef annotations bind to the final
         # class and don't keep the pre-slots class alive.
         _install_generic_init_signature(cls)
@@ -1924,7 +1954,8 @@ def _add_slots(cls, is_frozen, weakref_slot, defined_fields):
 
 def dataclass(cls=None, /, *, init=True, repr=True, eq=True, order=False,
               unsafe_hash=False, frozen=False, match_args=True,
-              kw_only=False, slots=False, weakref_slot=False):
+              kw_only=False, slots=False, weakref_slot=False,
+              c_accel=None):
     """Add dunder methods based on the fields defined in the class.
 
     Examines PEP 526 __annotations__ to determine fields.
@@ -1936,13 +1967,16 @@ def dataclass(cls=None, /, *, init=True, repr=True, eq=True, order=False,
     assigned to after instance creation. If match_args is true, the
     __match_args__ tuple is added. If kw_only is true, then by default
     all fields are keyword-only. If slots is true, a new class with a
-    __slots__ attribute is returned.
+    __slots__ attribute is returned. If c_accel is true, the experimental
+    C accelerator is used for this class. If c_accel is false, the C
+    accelerator is not used for this class. If c_accel is None, the
+    DATACLASSES_GENERIC environment setting controls the accelerator.
     """
 
     def wrap(cls):
         return _process_class(cls, init, repr, eq, order, unsafe_hash,
                               frozen, match_args, kw_only, slots,
-                              weakref_slot)
+                              weakref_slot, c_accel)
 
     # See if we're being called as @dataclass or @dataclass().
     if cls is None:
@@ -2140,7 +2174,8 @@ def _astuple_inner(obj, tuple_factory):
 def make_dataclass(cls_name, fields, *, bases=(), namespace=None, init=True,
                    repr=True, eq=True, order=False, unsafe_hash=False,
                    frozen=False, match_args=True, kw_only=False, slots=False,
-                   weakref_slot=False, module=None, qualname=None, decorator=dataclass):
+                   weakref_slot=False, module=None, qualname=None,
+                   decorator=dataclass, c_accel=None):
     """Return a new dynamically created dataclass.
 
     The dataclass name will be 'cls_name'.  'fields' is an iterable
@@ -2161,7 +2196,7 @@ def make_dataclass(cls_name, fields, *, bases=(), namespace=None, init=True,
     For the bases and namespace parameters, see the builtin type() function.
 
     The parameters init, repr, eq, order, unsafe_hash, frozen, match_args, kw_only,
-    slots, and weakref_slot are passed to dataclass().
+    slots, weakref_slot, and c_accel are passed to dataclass().
 
     If module parameter is defined, the '__module__' attribute of the dataclass is
     set to that value.
@@ -2261,10 +2296,13 @@ def make_dataclass(cls_name, fields, *, bases=(), namespace=None, init=True,
         cls.__qualname__ = qualname
 
     # Apply the normal provided decorator.
-    cls = decorator(cls, init=init, repr=repr, eq=eq, order=order,
-                    unsafe_hash=unsafe_hash, frozen=frozen,
-                    match_args=match_args, kw_only=kw_only, slots=slots,
-                    weakref_slot=weakref_slot)
+    decorator_kwargs = dict(init=init, repr=repr, eq=eq, order=order,
+                            unsafe_hash=unsafe_hash, frozen=frozen,
+                            match_args=match_args, kw_only=kw_only,
+                            slots=slots, weakref_slot=weakref_slot)
+    if c_accel is not None:
+        decorator_kwargs['c_accel'] = c_accel
+    cls = decorator(cls, **decorator_kwargs)
     # Now that the class is ready, allow the VALUE format.
     value_blocked = False
     return cls

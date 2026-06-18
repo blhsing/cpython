@@ -117,7 +117,7 @@ class TestCase(unittest.TestCase):
         expected_output = "_DataclassParams(init=True,repr=True," \
                           "eq=True,order=False,unsafe_hash=False,frozen=True," \
                           "match_args=True,kw_only=False," \
-                          "slots=True,weakref_slot=False)"
+                          "slots=True,weakref_slot=False,c_accel=None)"
         self.assertEqual(repr_output, expected_output)
 
     def test_dataclass_params_signature(self):
@@ -131,6 +131,46 @@ class TestCase(unittest.TestCase):
             if param == 'cls':
                 continue
             self.assertHasAttr(Some.__dataclass_params__, param)
+
+    @cpython_only
+    def test_c_accel_flag(self):
+        c_accel = import_helper.import_module('_dataclasses')
+        method_type = type(c_accel.init)
+
+        @dataclass(c_accel=True)
+        class Accelerated:
+            x: int
+
+        @dataclass(c_accel=False)
+        class Generated:
+            x: int
+
+        self.assertIs(type(Accelerated.__dict__['__init__']), method_type)
+        self.assertIsNot(type(Generated.__dict__['__init__']), method_type)
+        self.assertEqual(Accelerated(1).x, Generated(1).x)
+        self.assertIs(Accelerated.__dataclass_params__.c_accel, True)
+        self.assertIs(Generated.__dataclass_params__.c_accel, False)
+
+    @cpython_only
+    def test_make_dataclass_c_accel_flag(self):
+        c_accel = import_helper.import_module('_dataclasses')
+        method_type = type(c_accel.init)
+
+        C = make_dataclass('C', ['x'], c_accel=True)
+        self.assertIs(type(C.__dict__['__init__']), method_type)
+        self.assertEqual(C(1).x, 1)
+
+    @cpython_only
+    def test_slots_c_accel_flag(self):
+        c_accel = import_helper.import_module('_dataclasses')
+        method_type = type(c_accel.init)
+
+        @dataclass(slots=True, c_accel=True)
+        class C:
+            x: int
+
+        self.assertIs(type(C.__dict__['__init__']), method_type)
+        self.assertEqual(C(1).x, 1)
 
     def test_named_init_params(self):
         @dataclass
