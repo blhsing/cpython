@@ -24,6 +24,7 @@
 #  define Py_BUILD_CORE_MODULE
 #endif
 #include <Python.h>
+#include <string.h>
 #include "structmember.h"
 #include "internal/pycore_dict.h"    // _PyDictValues_AddToInsertionOrder()
 #include "internal/pycore_object.h"  // _PyObject_GetManagedDict()
@@ -72,7 +73,6 @@ typedef struct {
     int inline_ready;
     int all_slots_ready;
     unsigned int inline_type_version;
-    PyObject *param_index;
     PyObject *owner_spec;   /* strong ref: keeps the borrowed PyObjects alive */
     PyTypeObject *owner_type;  /* borrowed: the type owns the capsule */
 } dc_cspec;
@@ -123,7 +123,6 @@ cspec_destructor(PyObject *capsule)
     PyMem_Free(cs->kwonly);
     PyMem_Free(cs->assignments);
     PyMem_Free(cs->initvar_names);
-    Py_XDECREF(cs->param_index);
     Py_XDECREF(cs->owner_spec);
     PyMem_Free(cs);
 }
@@ -132,6 +131,11 @@ cspec_destructor(PyObject *capsule)
 static int
 fill_slots(PyObject *tup, dc_slot **out, Py_ssize_t *nout)
 {
+    if (!PyTuple_Check(tup)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "dataclass C spec entries must be tuples");
+        return -1;
+    }
     Py_ssize_t n = PyTuple_GET_SIZE(tup);
     dc_slot *arr = NULL;
     if (n > 0) {
@@ -142,6 +146,12 @@ fill_slots(PyObject *tup, dc_slot **out, Py_ssize_t *nout)
         }
         for (Py_ssize_t i = 0; i < n; i++) {
             PyObject *t = PyTuple_GET_ITEM(tup, i);
+            if (!PyTuple_Check(t) || PyTuple_GET_SIZE(t) != 3) {
+                PyMem_Free(arr);
+                PyErr_SetString(PyExc_TypeError,
+                                "dataclass C spec entries must be triples");
+                return -1;
+            }
             arr[i].name = PyTuple_GET_ITEM(t, 0);
             long code = PyLong_AsLong(PyTuple_GET_ITEM(t, 1));
             if (code == -1 && PyErr_Occurred()) {
@@ -160,40 +170,35 @@ fill_slots(PyObject *tup, dc_slot **out, Py_ssize_t *nout)
     return 0;
 }
 
-static PyObject *
-build_param_index(dc_cspec *cs)
+static int
+read_spec_parts(PyObject *spec, PyObject **pos, PyObject **kwonly,
+                PyObject **assignments, PyObject **initvar,
+                PyObject **hpi, PyObject **frz, PyObject **fst)
 {
-    PyObject *map = PyDict_New();
-    if (map == NULL) {
-        return NULL;
+    if (PyTuple_Check(spec) && PyTuple_GET_SIZE(spec) == 7) {
+        *pos = Py_NewRef(PyTuple_GET_ITEM(spec, 0));
+        *kwonly = Py_NewRef(PyTuple_GET_ITEM(spec, 1));
+        *assignments = Py_NewRef(PyTuple_GET_ITEM(spec, 2));
+        *initvar = Py_NewRef(PyTuple_GET_ITEM(spec, 3));
+        *hpi = Py_NewRef(PyTuple_GET_ITEM(spec, 4));
+        *frz = Py_NewRef(PyTuple_GET_ITEM(spec, 5));
+        *fst = Py_NewRef(PyTuple_GET_ITEM(spec, 6));
+        return 0;
     }
-    for (Py_ssize_t i = 0; i < cs->npos; i++) {
-        PyObject *idx = PyLong_FromSsize_t(i);
-        if (idx == NULL) {
-            Py_DECREF(map);
-            return NULL;
-        }
-        int res = PyDict_SetItem(map, cs->pos[i].name, idx);
-        Py_DECREF(idx);
-        if (res < 0) {
-            Py_DECREF(map);
-            return NULL;
-        }
+
+    *pos = PyObject_GetAttr(spec, S_pos);
+    *kwonly = PyObject_GetAttr(spec, S_kwonly);
+    *assignments = PyObject_GetAttr(spec, S_assignments);
+    *initvar = PyObject_GetAttr(spec, S_initvar_names);
+    *hpi = PyObject_GetAttr(spec, S_has_post_init);
+    *frz = PyObject_GetAttr(spec, S_frozen);
+    *fst = PyObject_GetAttr(spec, S_fast);
+    if (!*pos || !*kwonly || !*assignments || !*initvar ||
+        !*hpi || !*frz || !*fst)
+    {
+        return -1;
     }
-    for (Py_ssize_t i = 0; i < cs->nkw; i++) {
-        PyObject *idx = PyLong_FromSsize_t(cs->npos + i);
-        if (idx == NULL) {
-            Py_DECREF(map);
-            return NULL;
-        }
-        int res = PyDict_SetItem(map, cs->kwonly[i].name, idx);
-        Py_DECREF(idx);
-        if (res < 0) {
-            Py_DECREF(map);
-            return NULL;
-        }
-    }
-    return map;
+    return 0;
 }
 
 /* make_cspec(spec, cls) -> capsule wrapping dc_cspec*, called from dataclasses.py. */
@@ -218,15 +223,18 @@ make_cspec(PyObject *Py_UNUSED(mod), PyObject *const *args, Py_ssize_t nargs)
     if (cs == NULL)
         return PyErr_NoMemory();
 
-    PyObject *pos = PyObject_GetAttr(spec, S_pos);
-    PyObject *kwonly = PyObject_GetAttr(spec, S_kwonly);
-    PyObject *assignments = PyObject_GetAttr(spec, S_assignments);
-    PyObject *initvar = PyObject_GetAttr(spec, S_initvar_names);
-    PyObject *hpi = PyObject_GetAttr(spec, S_has_post_init);
-    PyObject *frz = PyObject_GetAttr(spec, S_frozen);
-    PyObject *fst = PyObject_GetAttr(spec, S_fast);
-    if (!pos || !kwonly || !assignments || !initvar || !hpi || !frz || !fst)
+    PyObject *pos = NULL;
+    PyObject *kwonly = NULL;
+    PyObject *assignments = NULL;
+    PyObject *initvar = NULL;
+    PyObject *hpi = NULL;
+    PyObject *frz = NULL;
+    PyObject *fst = NULL;
+    if (read_spec_parts(spec, &pos, &kwonly, &assignments, &initvar,
+                        &hpi, &frz, &fst) < 0)
+    {
         goto error;
+    }
 
     if (fill_slots(pos, &cs->pos, &cs->npos) < 0)
         goto error;
@@ -234,9 +242,11 @@ make_cspec(PyObject *Py_UNUSED(mod), PyObject *const *args, Py_ssize_t nargs)
         goto error;
     if (fill_slots(assignments, &cs->assignments, &cs->nassign) < 0)
         goto error;
-    cs->param_index = build_param_index(cs);
-    if (cs->param_index == NULL)
+    if (!PyTuple_Check(initvar)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "dataclass C initvar spec must be a tuple");
         goto error;
+    }
 
     cs->ninitvar = PyTuple_GET_SIZE(initvar);
     if (cs->ninitvar > 0) {
@@ -272,7 +282,6 @@ make_cspec(PyObject *Py_UNUSED(mod), PyObject *const *args, Py_ssize_t nargs)
         PyMem_Free(cs->kwonly);
         PyMem_Free(cs->assignments);
         PyMem_Free(cs->initvar_names);
-        Py_XDECREF(cs->param_index);
         Py_DECREF(cs->owner_spec);
         PyMem_Free(cs);
         return NULL;
@@ -291,7 +300,6 @@ error:
     PyMem_Free(cs->kwonly);
     PyMem_Free(cs->assignments);
     PyMem_Free(cs->initvar_names);
-    Py_XDECREF(cs->param_index);
     PyMem_Free(cs);
     return NULL;
 }
@@ -435,32 +443,50 @@ kw_count(PyObject *kwnames)
 static Py_ssize_t
 keyword_param_index(dc_cspec *cs, PyObject *key)
 {
-    PyObject *idx = PyDict_GetItemWithError(cs->param_index, key);
-    if (idx == NULL) {
-        return PyErr_Occurred() ? -2 : -1;
+    for (Py_ssize_t i = 0; i < cs->npos; i++) {
+        if (key == cs->pos[i].name) {
+            return i;
+        }
     }
-    return PyLong_AsSsize_t(idx);
+    for (Py_ssize_t i = 0; i < cs->nkw; i++) {
+        if (key == cs->kwonly[i].name) {
+            return cs->npos + i;
+        }
+    }
+    for (Py_ssize_t i = 0; i < cs->npos; i++) {
+        int eq = PyObject_RichCompareBool(key, cs->pos[i].name, Py_EQ);
+        if (eq < 0) {
+            return -2;
+        }
+        if (eq) {
+            return i;
+        }
+    }
+    for (Py_ssize_t i = 0; i < cs->nkw; i++) {
+        int eq = PyObject_RichCompareBool(key, cs->kwonly[i].name, Py_EQ);
+        if (eq < 0) {
+            return -2;
+        }
+        if (eq) {
+            return cs->npos + i;
+        }
+    }
+    return -1;
 }
 
-static PyObject **
+static int
 bind_fast_keywords(PyObject *self, dc_cspec *cs, PyObject *const *kwvalues,
-                   PyObject *kwnames, Py_ssize_t nargs)
+                   PyObject *kwnames, Py_ssize_t nargs, PyObject **bound)
 {
     Py_ssize_t nkw = kw_count(kwnames);
     if (nkw == 0) {
-        return NULL;
-    }
-    PyObject **bound = (PyObject **)PyMem_Calloc(cs->npos, sizeof(PyObject *));
-    if (bound == NULL) {
-        PyErr_NoMemory();
-        return NULL;
+        return 0;
     }
     for (Py_ssize_t i = 0; i < nkw; i++) {
         PyObject *key = PyTuple_GET_ITEM(kwnames, i);
         Py_ssize_t idx = keyword_param_index(cs, key);
         if (idx == -2) {
-            PyMem_Free(bound);
-            return NULL;
+            return -1;
         }
         if (idx < 0 || idx >= cs->npos) {
             PyObject *qual = get_type_attr(self, S_qualname);
@@ -468,8 +494,7 @@ bind_fast_keywords(PyObject *self, dc_cspec *cs, PyObject *const *kwvalues,
                 "%U.__init__() got an unexpected keyword argument %R",
                 qual, key);
             Py_XDECREF(qual);
-            PyMem_Free(bound);
-            return NULL;
+            return -1;
         }
         if (idx < nargs || bound[idx] != NULL) {
             PyObject *qual = get_type_attr(self, S_qualname);
@@ -477,12 +502,11 @@ bind_fast_keywords(PyObject *self, dc_cspec *cs, PyObject *const *kwvalues,
                 "%U.__init__() got multiple values for argument %R",
                 qual, key);
             Py_XDECREF(qual);
-            PyMem_Free(bound);
-            return NULL;
+            return -1;
         }
         bound[idx] = kwvalues[i];
     }
-    return bound;
+    return 0;
 }
 
 static PyObject *
@@ -673,8 +697,7 @@ refresh_store_cache(dc_cspec *cs, dc_slot *a, PyObject *self)
         update_inline_ready(self, cs);
         return;
     }
-    if (cs->frozen ||
-        tp->tp_setattro != PyObject_GenericSetAttr ||
+    if ((!cs->frozen && tp->tp_setattro != PyObject_GenericSetAttr) ||
         !(tp->tp_flags & Py_TPFLAGS_INLINE_VALUES))
     {
         Py_XDECREF(descr);
@@ -752,8 +775,7 @@ slot_store_cache_ready(PyObject *self, dc_cspec *cs)
     return 0;
 #else
     PyTypeObject *tp = Py_TYPE(self);
-    if (tp != cs->owner_type ||
-        cs->frozen)
+    if (tp != cs->owner_type)
     {
         return 0;
     }
@@ -825,8 +847,7 @@ static int
 inline_cache_ready(PyObject *self, dc_cspec *cs)
 {
     PyTypeObject *tp = Py_TYPE(self);
-    if (tp != cs->owner_type ||
-        cs->frozen)
+    if (tp != cs->owner_type)
     {
         return 0;
     }
@@ -998,37 +1019,37 @@ try_no_kw_inline_init(PyObject *self, dc_cspec *cs,
 static int
 store_attr(PyObject *self, dc_cspec *cs, dc_slot *a, PyObject *value)
 {
-    if (!cs->frozen) {
-        PyTypeObject *tp = Py_TYPE(self);
-        if (tp == cs->owner_type) {
-            if (a->store_kind == DC_STORE_UNKNOWN ||
-                a->type_version != tp->tp_version_tag)
+    PyTypeObject *tp = Py_TYPE(self);
+    if (tp == cs->owner_type) {
+        if (a->store_kind == DC_STORE_UNKNOWN ||
+            a->type_version != tp->tp_version_tag)
+        {
+            refresh_store_cache(cs, a, self);
+        }
+        if (a->type_version == tp->tp_version_tag) {
+            if (a->store_kind == DC_STORE_INLINE &&
+                store_inline_value(self, a, value) == 0)
             {
-                refresh_store_cache(cs, a, self);
+                return 0;
             }
-            if (a->type_version == tp->tp_version_tag) {
-                if (a->store_kind == DC_STORE_INLINE &&
-                    store_inline_value(self, a, value) == 0)
-                {
-                    return 0;
+            if (a->store_kind == DC_STORE_SLOT &&
+                store_slot_value(self, a, value) == 0)
+            {
+                return 0;
+            }
+            if (a->store_kind == DC_STORE_MANAGED) {
+                int res = PyObject_GenericSetAttr(self, a->name, value);
+                if (res == 0) {
+                    cache_inline_offset(self, cs, a);
                 }
-                if (a->store_kind == DC_STORE_SLOT &&
-                    store_slot_value(self, a, value) == 0)
-                {
-                    return 0;
-                }
-                if (a->store_kind == DC_STORE_MANAGED) {
-                    int res = PyObject_SetAttr(self, a->name, value);
-                    if (res == 0) {
-                        cache_inline_offset(self, cs, a);
-                    }
-                    return res;
-                }
+                return res;
             }
         }
-        return PyObject_SetAttr(self, a->name, value);
     }
-    return PyObject_GenericSetAttr(self, a->name, value);
+    if (cs->frozen) {
+        return PyObject_GenericSetAttr(self, a->name, value);
+    }
+    return PyObject_SetAttr(self, a->name, value);
 }
 
 static void
@@ -1300,11 +1321,76 @@ richcompare_eq_bool(PyObject *a, PyObject *b)
 }
 
 static int
+exact_eq_borrowed(PyObject *a, PyObject *b)
+{
+    if (PyFloat_CheckExact(a) && PyFloat_CheckExact(b)) {
+        return PyFloat_AS_DOUBLE(a) == PyFloat_AS_DOUBLE(b);
+    }
+    if (a == b) {
+        if (a == Py_None || PyBool_Check(a) ||
+            PyLong_CheckExact(a) || PyUnicode_CheckExact(a) ||
+            PyBytes_CheckExact(a))
+        {
+            return 1;
+        }
+        return -2;
+    }
+    if (PyUnicode_CheckExact(a) && PyUnicode_CheckExact(b)) {
+        int cmp = PyUnicode_Compare(a, b);
+        if (cmp == -1 && PyErr_Occurred()) {
+            return -1;
+        }
+        return cmp == 0;
+    }
+    if (PyBytes_CheckExact(a) && PyBytes_CheckExact(b)) {
+        Py_ssize_t na = PyBytes_GET_SIZE(a);
+        if (na != PyBytes_GET_SIZE(b)) {
+            return 0;
+        }
+        return memcmp(PyBytes_AS_STRING(a), PyBytes_AS_STRING(b),
+                      (size_t)na) == 0;
+    }
+    if (PyLong_CheckExact(a) && PyLong_CheckExact(b)) {
+        return PyObject_RichCompareBool(a, b, Py_EQ);
+    }
+    if (PyBool_Check(a) && PyBool_Check(b)) {
+        return a == b;
+    }
+    if (a == Py_None || b == Py_None) {
+        return 0;
+    }
+    return -2;
+}
+
+static int
+dataclass_eq_bool(PyObject *a, PyObject *b)
+{
+    int cmp = exact_eq_borrowed(a, b);
+    if (cmp != -2) {
+        return cmp;
+    }
+    return richcompare_eq_bool(a, b);
+}
+
+static int
 direct_eq_compare_field(PyObject *self, PyObject *other, dc_read_slot *r,
                         PyObject **result)
 {
     PyObject *a = load_direct_borrowed(self, r);
     PyObject *b = load_direct_borrowed(other, r);
+    if (a != NULL && b != NULL) {
+        int cmp = exact_eq_borrowed(a, b);
+        if (cmp == 0) {
+            *result = Py_NewRef(Py_False);
+            return 1;
+        }
+        if (cmp > 0) {
+            return 2;
+        }
+        if (cmp == -1) {
+            return -1;
+        }
+    }
     if (a == NULL) {
         a = PyObject_GetAttr(self, r->name);
         if (a == NULL) {
@@ -1324,7 +1410,7 @@ direct_eq_compare_field(PyObject *self, PyObject *other, dc_read_slot *r,
     else {
         Py_INCREF(b);
     }
-    int cmp = richcompare_eq_bool(a, b);
+    int cmp = dataclass_eq_bool(a, b);
     Py_DECREF(a);
     Py_DECREF(b);
     if (cmp < 0) {
@@ -1477,9 +1563,28 @@ dc_init_impl(PyObject *self, dc_cspec *cs, PyObject *const *args,
         Py_ssize_t nkw = kw_count(kwnames);
         PyObject *const *kwvalues = args + nargs;
         PyObject **kwbound = NULL;
+        PyObject *small_kwbound[16];
+        int kwbound_heap = 0;
         if (nkw) {
-            kwbound = bind_fast_keywords(self, cs, kwvalues, kwnames, nargs);
-            if (kwbound == NULL) {
+            if (cs->npos <= (Py_ssize_t)Py_ARRAY_LENGTH(small_kwbound)) {
+                kwbound = small_kwbound;
+            }
+            else {
+                kwbound = (PyObject **)PyMem_Malloc(
+                    cs->npos * sizeof(PyObject *));
+                if (kwbound == NULL) {
+                    PyErr_NoMemory();
+                    return NULL;
+                }
+                kwbound_heap = 1;
+            }
+            memset(kwbound, 0, cs->npos * sizeof(PyObject *));
+            if (bind_fast_keywords(self, cs, kwvalues, kwnames,
+                                   nargs, kwbound) < 0)
+            {
+                if (kwbound_heap) {
+                    PyMem_Free(kwbound);
+                }
                 return NULL;
             }
         }
@@ -1528,11 +1633,15 @@ dc_init_impl(PyObject *self, dc_cspec *cs, PyObject *const *args,
             raise_missing(self, "positional", missing);
             goto fast_err;
         }
-        PyMem_Free(kwbound);
+        if (kwbound_heap) {
+            PyMem_Free(kwbound);
+        }
         Py_RETURN_NONE;
     fast_err:
         Py_XDECREF(missing);
-        PyMem_Free(kwbound);
+        if (kwbound_heap) {
+            PyMem_Free(kwbound);
+        }
         return NULL;
     }
 
@@ -1847,7 +1956,7 @@ dc_eq_impl(PyObject *self, PyObject *other, dc_field_spec *fs)
         PyObject *b = fs ? load_field(other, fs, &fs->fields[(I)], fast_other) \
                          : PyObject_GetAttr(other, name); \
         if (!b) { Py_DECREF(a); Py_XDECREF(names); return NULL; } \
-        int cmp = richcompare_eq_bool(a, b); \
+        int cmp = dataclass_eq_bool(a, b); \
         Py_DECREF(a); \
         Py_DECREF(b); \
         if (cmp < 0) { Py_XDECREF(names); return NULL; } \
@@ -1900,7 +2009,7 @@ dc_eq_impl(PyObject *self, PyObject *other, dc_field_spec *fs)
         PyObject *b = fs ? load_field(other, fs, &fs->fields[i], fast_other)
                          : PyObject_GetAttr(other, name);
         if (!b) { Py_DECREF(a); Py_XDECREF(names); return NULL; }
-        int cmp = richcompare_eq_bool(a, b);
+        int cmp = dataclass_eq_bool(a, b);
         Py_DECREF(a);
         Py_DECREF(b);
         if (cmp < 0) { Py_XDECREF(names); return NULL; }
@@ -1912,9 +2021,74 @@ dc_eq_impl(PyObject *self, PyObject *other, dc_field_spec *fs)
 
 /* ----------------------------- __hash__ ----------------------------- */
 
+static inline Py_uhash_t
+tuple_hash_add(Py_uhash_t acc, Py_hash_t item_hash)
+{
+    Py_uhash_t lane = (Py_uhash_t)item_hash;
+    acc += lane * _PyTuple_HASH_XXPRIME_2;
+    acc = _PyTuple_HASH_XXROTATE(acc);
+    acc *= _PyTuple_HASH_XXPRIME_1;
+    return acc;
+}
+
+static inline Py_hash_t
+tuple_hash_finish(Py_uhash_t acc, Py_ssize_t n)
+{
+    acc += n ^ (_PyTuple_HASH_XXPRIME_5 ^ 3527539UL);
+    if (acc == (Py_uhash_t)-1) {
+        acc = 1546275796;
+    }
+    return (Py_hash_t)acc;
+}
+
+static int
+exact_hash_borrowed(PyObject *v, Py_hash_t *hash)
+{
+    if (v == Py_None || PyBool_Check(v) || PyLong_CheckExact(v) ||
+        PyUnicode_CheckExact(v) || PyBytes_CheckExact(v) ||
+        PyFloat_CheckExact(v))
+    {
+        *hash = PyObject_Hash(v);
+        return *hash == -1 ? -1 : 1;
+    }
+    return 0;
+}
+
+static PyObject *
+dc_hash_direct_impl(PyObject *self, dc_field_spec *fs)
+{
+    if (!field_spec_direct_ready(self, self, fs)) {
+        return NULL;
+    }
+    Py_uhash_t acc = _PyTuple_HASH_XXPRIME_5;
+    for (Py_ssize_t i = 0; i < fs->n; i++) {
+        PyObject *v = load_direct_borrowed(self, &fs->fields[i]);
+        if (v == NULL) {
+            return NULL;
+        }
+        Py_hash_t item_hash;
+        int res = exact_hash_borrowed(v, &item_hash);
+        if (res <= 0) {
+            return NULL;
+        }
+        acc = tuple_hash_add(acc, item_hash);
+    }
+    return PyLong_FromSsize_t(tuple_hash_finish(acc, fs->n));
+}
+
 static PyObject *
 dc_hash_impl(PyObject *self, dc_field_spec *fs)
 {
+    if (fs != NULL) {
+        PyObject *direct = dc_hash_direct_impl(self, fs);
+        if (direct != NULL) {
+            return direct;
+        }
+        if (PyErr_Occurred()) {
+            return NULL;
+        }
+    }
+
     PyObject *names = fs ? NULL : get_type_attr(self, S_hash_fields);
     if (!fs && !names)
         return NULL;
@@ -1953,13 +2127,11 @@ dc_hash_impl(PyObject *self, dc_field_spec *fs)
     Py_uhash_t acc = _PyTuple_HASH_XXPRIME_5;
 #define DC_HASH_ITEM(I) \
     do { \
-        Py_uhash_t lane = PyObject_Hash(items[(I)]); \
-        if (lane == (Py_uhash_t)-1) { \
+        Py_hash_t lane = PyObject_Hash(items[(I)]); \
+        if (lane == -1) { \
             goto error_no_names; \
         } \
-        acc += lane * _PyTuple_HASH_XXPRIME_2; \
-        acc = _PyTuple_HASH_XXROTATE(acc); \
-        acc *= _PyTuple_HASH_XXPRIME_1; \
+        acc = tuple_hash_add(acc, lane); \
     } while (0)
 
     switch (n) {
@@ -1998,18 +2170,13 @@ dc_hash_impl(PyObject *self, dc_field_spec *fs)
     }
 #undef DC_HASH_ITEM
 
-    acc += n ^ (_PyTuple_HASH_XXPRIME_5 ^ 3527539UL);
-    if (acc == (Py_uhash_t)-1) {
-        acc = 1546275796;
-    }
-
     for (Py_ssize_t i = 0; i < n; i++) {
         Py_DECREF(items[i]);
     }
     if (items != small_items) {
         PyMem_Free(items);
     }
-    return PyLong_FromSsize_t((Py_hash_t)acc);
+    return PyLong_FromSsize_t(tuple_hash_finish(acc, n));
 
 error:
     Py_XDECREF(names);

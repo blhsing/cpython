@@ -239,6 +239,15 @@ class TestCase(unittest.TestCase):
         self.assertEqual(hash(c), hash((1, 3)))
 
     @cpython_only
+    def test_fast_build_eq_nan_field(self):
+        @dataclass(fast_build=True)
+        class C:
+            x: float
+
+        nan = float('nan')
+        self.assertNotEqual(C(nan), C(nan))
+
+    @cpython_only
     def test_fast_build_slots_and_frozen(self):
         accel = import_helper.import_module('_dataclasses')
         method_type = type(accel.init)

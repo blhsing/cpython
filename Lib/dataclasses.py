@@ -1056,6 +1056,14 @@ class _InitSpec:
         )
 
 
+def _init_spec_parts(cls):
+    spec = cls.__dataclass_init_spec__
+    if type(spec) is tuple:
+        return spec
+    return (spec.pos, spec.kwonly, spec.assignments, spec.initvar_names,
+            spec.has_post_init, spec.frozen, spec.fast)
+
+
 def _make_init_spec(all_init_fields, std_init_fields, kw_only_init_fields,
                     frozen, has_post_init, slots):
     # Same validation the codegen path gets for free from exec(): a
@@ -1094,8 +1102,18 @@ def _make_init_spec(all_init_fields, std_init_fields, kw_only_init_fields,
         elif slots and f.default is not MISSING:
             assignments.append((f.name, _GEN_A_CONST, f.default))
         # else: no assignment (reading falls back to the class attribute).
-    return _InitSpec(pos, kwonly, tuple(assignments), tuple(initvar_names),
-                     has_post_init, frozen)
+    assignments = tuple(assignments)
+    initvar_names = tuple(initvar_names)
+    fast = (
+        not has_post_init
+        and not kwonly
+        and not initvar_names
+        and len(assignments) == len(pos)
+        and all(assignments[i][1] == 0 and assignments[i][0] == pos[i][0]
+                for i in range(len(pos)))
+    )
+    return (pos, kwonly, assignments, initvar_names, has_post_init,
+            frozen, fast)
 
 
 def _make_frozen_set_del(__class__, fieldset):
@@ -1132,15 +1150,16 @@ def _dataclass_init_parameters(cls, with_self):
     # resolves what it can (so `param.annotation is int`) and leaves the rest
     # as ForwardRefs (so undefined names still render in docstrings).
     import inspect
-    spec = cls.__dataclass_init_spec__
+    pos, kwonly, assignments, initvar_names, has_post_init, frozen, fast = (
+        _init_spec_parts(cls))
     anns = annotationlib.get_annotations(
         cls, format=annotationlib.Format.FORWARDREF)
     P = inspect.Parameter
     empty = P.empty
     params = []
     if with_self:
-        names = {n for (n, _, _) in spec.pos}
-        names.update(n for (n, _, _) in spec.kwonly)
+        names = {n for (n, _, _) in pos}
+        names.update(n for (n, _, _) in kwonly)
         params.append(P('__dataclass_self__' if 'self' in names else 'self',
                         P.POSITIONAL_OR_KEYWORD))
 
@@ -1153,9 +1172,9 @@ def _dataclass_init_parameters(cls, with_self):
             default = empty
         return P(name, pkind, default=default, annotation=anns.get(name, empty))
 
-    for (name, kind, extra) in spec.pos:
+    for (name, kind, extra) in pos:
         params.append(make(name, kind, extra, P.POSITIONAL_OR_KEYWORD))
-    for (name, kind, extra) in spec.kwonly:
+    for (name, kind, extra) in kwonly:
         params.append(make(name, kind, extra, P.KEYWORD_ONLY))
     return params
 
@@ -1236,9 +1255,10 @@ def _install_fast_build_methods(cls, fields, all_init_fields, std_init_fields,
 
 
 def _c_init_metadata(cls):
-    spec = cls.__dataclass_init_spec__
-    annotation_fields = [n for n, _, _ in spec.pos]
-    annotation_fields.extend(n for n, _, _ in spec.kwonly)
+    pos, kwonly, assignments, initvar_names, has_post_init, frozen, fast = (
+        _init_spec_parts(cls))
+    annotation_fields = [n for n, _, _ in pos]
+    annotation_fields.extend(n for n, _, _ in kwonly)
     return (_make_annotate_function(cls, '__init__', annotation_fields, None),
             _FastBuildInitSignature(cls))
 
