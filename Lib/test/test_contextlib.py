@@ -16,6 +16,7 @@ except ModuleNotFoundError:
 from contextlib import *  # Tests __all__
 from test import support
 from test.support import os_helper, script_helper
+from test.support import warnings_helper
 from test.support.testcase import ExceptionIsLikeMixin
 import weakref
 
@@ -1689,6 +1690,7 @@ class TestTimeout(unittest.TestCase):
         self.assertEqual(err, b"")
 
     @support.requires_fork()
+    @warnings_helper.ignore_fork_in_thread_deprecation_warnings()
     def test_timeout_works_after_fork_without_active_timeout(self):
         with timeout(support.SHORT_TIMEOUT):
             pass
@@ -1709,6 +1711,7 @@ class TestTimeout(unittest.TestCase):
         support.wait_process(pid, exitcode=0, timeout=support.SHORT_TIMEOUT)
 
     @support.requires_fork()
+    @warnings_helper.ignore_fork_in_thread_deprecation_warnings()
     def test_active_timeout_works_after_fork(self):
         with timeout(0.5):
             pid = os.fork()
