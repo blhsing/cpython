@@ -1636,7 +1636,7 @@ class TestTimeout(unittest.TestCase):
             print("ok")
         """)
         _, out, err = script_helper.assert_python_ok("-c", code)
-        self.assertEqual(out, b"ok\n")
+        self.assertEqual(out.splitlines(), [b"ok"])
         self.assertEqual(err, b"")
 
     def test_direct_leave_after_scheduler_init(self):
@@ -1686,7 +1686,7 @@ class TestTimeout(unittest.TestCase):
             print("ok")
         """)
         _, out, err = script_helper.assert_python_ok("-c", code)
-        self.assertEqual(out, b"ok\n")
+        self.assertEqual(out.splitlines(), [b"ok"])
         self.assertEqual(err, b"")
 
     @support.requires_fork()
@@ -1743,7 +1743,7 @@ class TestTimeout(unittest.TestCase):
         """)
         _, out, err = script_helper.assert_python_ok(
             "-c", code, PYTHON_GIL="0", __isolated=False)
-        self.assertEqual(out, b"ok\n")
+        self.assertEqual(out.splitlines(), [b"ok"])
         self.assertEqual(err, b"")
 
 
