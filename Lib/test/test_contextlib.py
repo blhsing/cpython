@@ -4,12 +4,14 @@ import io
 import os
 import sys
 import tempfile
+import textwrap
 import threading
 import traceback
 import unittest
+import _timeout
 from contextlib import *  # Tests __all__
 from test import support
-from test.support import os_helper
+from test.support import os_helper, script_helper
 from test.support.testcase import ExceptionIsLikeMixin
 import weakref
 
@@ -1577,6 +1579,140 @@ class TestChdir(unittest.TestCase):
         except RuntimeError as re:
             self.assertEqual(str(re), "boom")
         self.assertEqual(os.getcwd(), old_cwd)
+
+
+class TestTimeout(unittest.TestCase):
+
+    def test_normal_exit(self):
+        with timeout(support.SHORT_TIMEOUT) as cm:
+            self.assertIsInstance(cm, timeout)
+
+    def test_negative_timeout(self):
+        with self.assertRaises(ValueError):
+            with timeout(-1):
+                pass
+
+    def test_direct_check_and_leave_before_enter(self):
+        code = textwrap.dedent("""
+            import _timeout
+
+            assert _timeout.check() is False
+            try:
+                _timeout.leave()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("inactive timeout did not fail")
+            print("ok")
+        """)
+        _, out, err = script_helper.assert_python_ok("-c", code)
+        self.assertEqual(out, b"ok\n")
+        self.assertEqual(err, b"")
+
+    def test_direct_leave_after_scheduler_init(self):
+        with timeout(support.SHORT_TIMEOUT):
+            pass
+
+        with self.assertRaises(RuntimeError):
+            _timeout.leave()
+
+    def test_timeout_expires_in_pure_python(self):
+        with self.assertRaises(TimeoutError):
+            with timeout(0.01):
+                while True:
+                    pass
+
+    def test_finally_runs_after_timeout(self):
+        state = []
+
+        with self.assertRaises(TimeoutError):
+            with timeout(0.01):
+                try:
+                    while True:
+                        pass
+                finally:
+                    state.append("finally")
+
+        self.assertEqual(state, ["finally"])
+
+    def test_nested_timeout_uses_earliest_deadline(self):
+        with self.assertRaises(TimeoutError):
+            with timeout(0.01):
+                with timeout(support.SHORT_TIMEOUT):
+                    while True:
+                        pass
+
+    def test_thread_clear_removes_active_timeout(self):
+        code = textwrap.dedent("""
+            import _timeout
+            import threading
+
+            def worker():
+                _timeout.enter(3600)
+
+            thread = threading.Thread(target=worker)
+            thread.start()
+            thread.join()
+            print("ok")
+        """)
+        _, out, err = script_helper.assert_python_ok("-c", code)
+        self.assertEqual(out, b"ok\n")
+        self.assertEqual(err, b"")
+
+    @support.requires_fork()
+    def test_timeout_works_after_fork_without_active_timeout(self):
+        with timeout(support.SHORT_TIMEOUT):
+            pass
+
+        pid = os.fork()
+        if pid == 0:
+            try:
+                with timeout(0.05):
+                    while True:
+                        pass
+            except TimeoutError:
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+            else:
+                os._exit(1)
+
+        support.wait_process(pid, exitcode=0, timeout=support.SHORT_TIMEOUT)
+
+    @support.requires_fork()
+    def test_active_timeout_works_after_fork(self):
+        with timeout(0.5):
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    while True:
+                        pass
+                except TimeoutError:
+                    os._exit(0)
+                except BaseException:
+                    os._exit(2)
+                else:
+                    os._exit(1)
+
+        support.wait_process(pid, exitcode=0, timeout=support.SHORT_TIMEOUT)
+
+    @unittest.skipUnless(support.Py_GIL_DISABLED, "requires free-threaded build")
+    def test_timeout_module_does_not_enable_gil(self):
+        code = textwrap.dedent("""
+            import sys
+
+            assert not sys._is_gil_enabled()
+            import _timeout
+            assert not sys._is_gil_enabled()
+            _timeout.enter(1.0)
+            _timeout.leave()
+            assert not sys._is_gil_enabled()
+            print("ok")
+        """)
+        _, out, err = script_helper.assert_python_ok(
+            "-c", code, PYTHON_GIL="0", __isolated=False)
+        self.assertEqual(out, b"ok\n")
+        self.assertEqual(err, b"")
 
 
 if __name__ == "__main__":

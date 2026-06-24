@@ -171,6 +171,12 @@ extern void _PyEval_StartTheWorldAll(_PyRuntimeState *runtime);
 extern PyAPI_FUNC(void) _PyEval_StopTheWorld(PyInterpreterState *interp);
 extern PyAPI_FUNC(void) _PyEval_StartTheWorld(PyInterpreterState *interp);
 
+extern int _PyTimeout_Push(PyThreadState *tstate, PyTime_t timeout);
+extern int _PyTimeout_Pop(PyThreadState *tstate);
+extern int _PyTimeout_CheckNow(PyThreadState *tstate);
+extern int _PyTimeout_HandleExpired(PyThreadState *tstate);
+extern void _PyTimeout_ClearThread(PyThreadState *tstate);
+
 
 static inline void
 _Py_EnsureFuncTstateNotNULL(const char *func, PyThreadState *tstate)

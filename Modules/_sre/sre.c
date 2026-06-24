@@ -44,6 +44,7 @@ static const char copyright[] =
 #include "pycore_long.h"             // _PyLong_GetZero()
 #include "pycore_list.h"             // _PyList_AppendTakeRef()
 #include "pycore_moduleobject.h"     // _PyModule_GetState()
+#include "pycore_pystate.h"          // _PyTimeout_CheckNow()
 #include "pycore_tuple.h"            // _PyTuple_FromPairSteal
 #include "pycore_unicodeobject.h"    // _PyUnicode_Copy
 #include "pycore_weakref.h"          // FT_CLEAR_WEAKREFS()

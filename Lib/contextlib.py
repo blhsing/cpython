@@ -4,6 +4,7 @@ import abc
 import os
 import sys
 import _collections_abc
+import _timeout
 from collections import deque
 from functools import wraps
 lazy from inspect import (
@@ -17,7 +18,7 @@ __all__ = ["asynccontextmanager", "contextmanager", "closing", "nullcontext",
            "AbstractContextManager", "AbstractAsyncContextManager",
            "AsyncExitStack", "ContextDecorator", "ExitStack",
            "redirect_stdout", "redirect_stderr", "suppress", "aclosing",
-           "chdir"]
+           "chdir", "timeout"]
 
 
 class AbstractContextManager(abc.ABC):
@@ -857,3 +858,18 @@ class chdir(AbstractContextManager):
 
     def __exit__(self, *excinfo):
         os.chdir(self._old_cwd.pop())
+
+
+class timeout(AbstractContextManager):
+    """Context manager that raises TimeoutError after the given delay."""
+
+    def __init__(self, seconds):
+        self._seconds = seconds
+
+    def __enter__(self):
+        _timeout.enter(self._seconds)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        _timeout.leave()
+        return False

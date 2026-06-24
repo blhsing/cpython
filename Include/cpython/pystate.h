@@ -61,6 +61,8 @@ typedef struct _stack_chunk {
     PyObject * data[1]; /* Variable sized */
 } _PyStackChunk;
 
+struct _timeout_block;
+
 /* Minimum size of data stack chunk */
 #define _PY_DATA_STACK_CHUNK_SIZE (16*1024)
 struct _ts {
@@ -253,6 +255,8 @@ struct _ts {
         /* The interpreter guard owned by PyThreadState_EnsureFromView(), if any. */
         PyInterpreterGuard *owned_guard;
     } ensure;
+
+    struct _timeout_block *timeout_block;
 };
 
 /* other API */

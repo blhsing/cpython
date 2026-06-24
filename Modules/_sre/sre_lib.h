@@ -550,8 +550,13 @@ typedef struct {
 
 #define _MAYBE_CHECK_SIGNALS                                       \
     do {                                                           \
-        if ((0 == (++sigcount & 0xfff)) && PyErr_CheckSignals()) { \
-            RETURN_ERROR(SRE_ERROR_INTERRUPTED);                   \
+        if (0 == (++sigcount & 0xfff)) {                           \
+            if (PyErr_CheckSignals()) {                            \
+                RETURN_ERROR(SRE_ERROR_INTERRUPTED);               \
+            }                                                      \
+            if (_PyTimeout_CheckNow(_PyThreadState_GET())) {       \
+                RETURN_ERROR(SRE_ERROR_INTERRUPTED);               \
+            }                                                      \
         }                                                          \
     } while (0)
 
