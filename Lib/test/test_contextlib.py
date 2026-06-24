@@ -9,6 +9,10 @@ import threading
 import traceback
 import unittest
 import _timeout
+try:
+    import _interpreters
+except ModuleNotFoundError:
+    _interpreters = None
 from contextlib import *  # Tests __all__
 from test import support
 from test.support import os_helper, script_helper
@@ -1593,6 +1597,20 @@ class TestTimeout(unittest.TestCase):
             raise
         else:
             _timeout.leave()
+
+    @unittest.skipIf(_interpreters is None, "subinterpreters required")
+    @unittest.skipIf(
+        support.is_android or support.is_apple_mobile,
+        "Subinterpreters are not supported on Android and iOS"
+    )
+    def test_import_contextlib_in_subinterpreter(self):
+        interp = _interpreters.create()
+        try:
+            excsnap = _interpreters.run_string(interp, "import contextlib")
+        finally:
+            _interpreters.destroy(interp)
+
+        self.assertIsNone(excsnap, excsnap)
 
     def test_normal_exit(self):
         with timeout(support.SHORT_TIMEOUT) as cm:

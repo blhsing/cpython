@@ -54,23 +54,26 @@ static PyMethodDef timeout_methods[] = {
 };
 
 
+static PyModuleDef_Slot timeout_slots[] = {
+    _Py_ABI_SLOT,
+    {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
+    {0, NULL}
+};
+
+
 static struct PyModuleDef timeoutmodule = {
     PyModuleDef_HEAD_INIT,
     .m_name = "_timeout",
     .m_doc = "Prototype synchronous timeout support.",
     .m_size = 0,
     .m_methods = timeout_methods,
+    .m_slots = timeout_slots,
 };
 
 
 PyMODINIT_FUNC
 PyInit__timeout(void)
 {
-    PyObject *module = PyModule_Create(&timeoutmodule);
-#ifdef Py_GIL_DISABLED
-    if (module != NULL) {
-        PyUnstable_Module_SetGIL(module, Py_MOD_GIL_NOT_USED);
-    }
-#endif
-    return module;
+    return PyModuleDef_Init(&timeoutmodule);
 }
