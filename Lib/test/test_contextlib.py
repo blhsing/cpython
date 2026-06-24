@@ -1583,6 +1583,17 @@ class TestChdir(unittest.TestCase):
 
 class TestTimeout(unittest.TestCase):
 
+    @classmethod
+    def setUpClass(cls):
+        try:
+            _timeout.enter(support.SHORT_TIMEOUT)
+        except RuntimeError as exc:
+            if "failed to start timeout scheduler thread" in str(exc):
+                raise unittest.SkipTest("timeout scheduler thread unavailable")
+            raise
+        else:
+            _timeout.leave()
+
     def test_normal_exit(self):
         with timeout(support.SHORT_TIMEOUT) as cm:
             self.assertIsInstance(cm, timeout)

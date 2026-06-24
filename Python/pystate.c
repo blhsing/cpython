@@ -63,66 +63,54 @@ typedef struct _timeout_block {
     struct _timeout_block *sched_next;
 } _PyTimeoutBlock;
 
-static struct {
-    PyMUTEX_T mutex;
-    PyCOND_T cond;
-    PyThread_ident_t ident;
-    PyThread_handle_t handle;
-    int initialized;
-    int running;
-    int stopping;
-    _PyTimeoutBlock *head;
-} timeout_scheduler;
-
-static _PyOnceFlag timeout_scheduler_once = {0};
-
 static void
-timeout_mutex_lock(void)
+timeout_mutex_lock(struct _timeout_scheduler_state *scheduler)
 {
-    if (PyMUTEX_LOCK(&timeout_scheduler.mutex)) {
+    if (PyMUTEX_LOCK(&scheduler->mutex)) {
         Py_FatalError("PyMUTEX_LOCK(timeout_scheduler.mutex) failed");
     }
 }
 
 static void
-timeout_mutex_unlock(void)
+timeout_mutex_unlock(struct _timeout_scheduler_state *scheduler)
 {
-    if (PyMUTEX_UNLOCK(&timeout_scheduler.mutex)) {
+    if (PyMUTEX_UNLOCK(&scheduler->mutex)) {
         Py_FatalError("PyMUTEX_UNLOCK(timeout_scheduler.mutex) failed");
     }
 }
 
 static void
-timeout_cond_signal(void)
+timeout_cond_signal(struct _timeout_scheduler_state *scheduler)
 {
-    if (PyCOND_SIGNAL(&timeout_scheduler.cond)) {
+    if (PyCOND_SIGNAL(&scheduler->cond)) {
         Py_FatalError("PyCOND_SIGNAL(timeout_scheduler.cond) failed");
     }
 }
 
 static void
-timeout_cond_broadcast(void)
+timeout_cond_broadcast(struct _timeout_scheduler_state *scheduler)
 {
-    if (PyCOND_BROADCAST(&timeout_scheduler.cond)) {
+    if (PyCOND_BROADCAST(&scheduler->cond)) {
         Py_FatalError("PyCOND_BROADCAST(timeout_scheduler.cond) failed");
     }
 }
 
 static void
-timeout_cond_wait(void)
+timeout_cond_wait(struct _timeout_scheduler_state *scheduler)
 {
-    if (PyCOND_WAIT(&timeout_scheduler.cond, &timeout_scheduler.mutex)) {
+    if (PyCOND_WAIT(&scheduler->cond, &scheduler->mutex)) {
         Py_FatalError("PyCOND_WAIT(timeout_scheduler.cond) failed");
     }
 }
 
 static int
-timeout_find_next_deadline_unlocked(PyTime_t *deadline)
+timeout_find_next_deadline_unlocked(struct _timeout_scheduler_state *scheduler,
+                                    PyTime_t *deadline)
 {
     int found = 0;
     PyTime_t earliest = 0;
 
-    for (_PyTimeoutBlock *block = timeout_scheduler.head;
+    for (_PyTimeoutBlock *block = scheduler->head;
          block != NULL;
          block = block->sched_next)
     {
@@ -155,9 +143,10 @@ timeout_as_microseconds(PyTime_t ns)
 }
 
 static void
-timeout_notify_expired_unlocked(PyTime_t now)
+timeout_notify_expired_unlocked(struct _timeout_scheduler_state *scheduler,
+                                PyTime_t now)
 {
-    for (_PyTimeoutBlock *block = timeout_scheduler.head;
+    for (_PyTimeoutBlock *block = scheduler->head;
          block != NULL;
          block = block->sched_next)
     {
@@ -169,19 +158,19 @@ timeout_notify_expired_unlocked(PyTime_t now)
 }
 
 static void
-timeout_scheduler_thread(void *unused)
+timeout_scheduler_thread(void *arg)
 {
-    (void)unused;
+    struct _timeout_scheduler_state *scheduler = arg;
 
-    timeout_mutex_lock();
+    timeout_mutex_lock(scheduler);
     for (;;) {
         PyTime_t deadline;
-        while (!timeout_scheduler.stopping &&
-               !timeout_find_next_deadline_unlocked(&deadline))
+        while (!scheduler->stopping &&
+               !timeout_find_next_deadline_unlocked(scheduler, &deadline))
         {
-            timeout_cond_wait();
+            timeout_cond_wait(scheduler);
         }
-        if (timeout_scheduler.stopping) {
+        if (scheduler->stopping) {
             break;
         }
 
@@ -189,8 +178,8 @@ timeout_scheduler_thread(void *unused)
         (void)PyTime_MonotonicRaw(&now);
         PyTime_t remaining = deadline - now;
         if (remaining > 0) {
-            int r = PyCOND_TIMEDWAIT(&timeout_scheduler.cond,
-                                     &timeout_scheduler.mutex,
+            int r = PyCOND_TIMEDWAIT(&scheduler->cond,
+                                     &scheduler->mutex,
                                      timeout_as_microseconds(remaining));
             if (r < 0) {
                 Py_FatalError("PyCOND_TIMEDWAIT(timeout_scheduler.cond) failed");
@@ -198,101 +187,103 @@ timeout_scheduler_thread(void *unused)
             continue;
         }
 
-        timeout_notify_expired_unlocked(now);
+        timeout_notify_expired_unlocked(scheduler, now);
     }
-    timeout_mutex_unlock();
+    timeout_mutex_unlock(scheduler);
 }
 
 static int
-timeout_scheduler_init(void *unused)
+timeout_scheduler_init(void *arg)
 {
-    (void)unused;
+    struct _timeout_scheduler_state *scheduler = arg;
 
-    if (PyMUTEX_INIT(&timeout_scheduler.mutex)) {
+    if (PyMUTEX_INIT(&scheduler->mutex)) {
         PyErr_SetString(PyExc_RuntimeError, "failed to initialize timeout mutex");
         return -1;
     }
-    if (PyCOND_INIT(&timeout_scheduler.cond)) {
-        (void)PyMUTEX_FINI(&timeout_scheduler.mutex);
+    if (PyCOND_INIT(&scheduler->cond)) {
+        (void)PyMUTEX_FINI(&scheduler->mutex);
         PyErr_SetString(PyExc_RuntimeError, "failed to initialize timeout condition");
         return -1;
     }
-    timeout_scheduler.initialized = 1;
-    timeout_scheduler.stopping = 0;
-    timeout_scheduler.head = NULL;
-    if (PyThread_start_joinable_thread(timeout_scheduler_thread, NULL,
-                                       &timeout_scheduler.ident,
-                                       &timeout_scheduler.handle))
+    scheduler->initialized = 1;
+    scheduler->stopping = 0;
+    scheduler->head = NULL;
+    if (PyThread_start_joinable_thread(timeout_scheduler_thread, scheduler,
+                                       &scheduler->ident,
+                                       &scheduler->handle))
     {
-        (void)PyCOND_FINI(&timeout_scheduler.cond);
-        (void)PyMUTEX_FINI(&timeout_scheduler.mutex);
-        timeout_scheduler.initialized = 0;
-        timeout_scheduler.handle = 0;
-        timeout_scheduler.ident = 0;
+        (void)PyCOND_FINI(&scheduler->cond);
+        (void)PyMUTEX_FINI(&scheduler->mutex);
+        scheduler->initialized = 0;
+        scheduler->handle = 0;
+        scheduler->ident = 0;
         PyErr_SetString(PyExc_RuntimeError, "failed to start timeout scheduler thread");
         return -1;
     }
-    timeout_scheduler.running = 1;
+    scheduler->running = 1;
     return 0;
 }
 
 static void
-timeout_scheduler_fini(void)
+timeout_scheduler_fini(struct _timeout_scheduler_state *scheduler)
 {
-    if (!timeout_scheduler.initialized) {
-        timeout_scheduler_once = (_PyOnceFlag){0};
+    if (!scheduler->initialized) {
+        scheduler->once = (_PyOnceFlag){0};
         return;
     }
 
-    if (timeout_scheduler.running) {
-        timeout_mutex_lock();
-        timeout_scheduler.stopping = 1;
-        timeout_cond_broadcast();
-        timeout_mutex_unlock();
+    if (scheduler->running) {
+        timeout_mutex_lock(scheduler);
+        scheduler->stopping = 1;
+        timeout_cond_broadcast(scheduler);
+        timeout_mutex_unlock(scheduler);
 
-        if (PyThread_join_thread(timeout_scheduler.handle)) {
+        if (PyThread_join_thread(scheduler->handle)) {
             Py_FatalError("PyThread_join_thread(timeout_scheduler) failed");
         }
-        timeout_scheduler.running = 0;
+        scheduler->running = 0;
     }
 
-    if (timeout_scheduler.head != NULL) {
+    if (scheduler->head != NULL) {
         Py_FatalError("timeout scheduler stopped with active timeouts");
     }
 
-    if (PyCOND_FINI(&timeout_scheduler.cond)) {
+    if (PyCOND_FINI(&scheduler->cond)) {
         Py_FatalError("PyCOND_FINI(timeout_scheduler.cond) failed");
     }
-    if (PyMUTEX_FINI(&timeout_scheduler.mutex)) {
+    if (PyMUTEX_FINI(&scheduler->mutex)) {
         Py_FatalError("PyMUTEX_FINI(timeout_scheduler.mutex) failed");
     }
 
-    timeout_scheduler.handle = 0;
-    timeout_scheduler.ident = 0;
-    timeout_scheduler.initialized = 0;
-    timeout_scheduler.stopping = 0;
-    timeout_scheduler_once = (_PyOnceFlag){0};
+    scheduler->handle = 0;
+    scheduler->ident = 0;
+    scheduler->initialized = 0;
+    scheduler->stopping = 0;
+    scheduler->once = (_PyOnceFlag){0};
 }
 
 static void
-timeout_schedule_block_unlocked(_PyTimeoutBlock *block)
+timeout_schedule_block_unlocked(struct _timeout_scheduler_state *scheduler,
+                                _PyTimeoutBlock *block)
 {
     block->sched_prev = NULL;
-    block->sched_next = timeout_scheduler.head;
-    if (timeout_scheduler.head != NULL) {
-        timeout_scheduler.head->sched_prev = block;
+    block->sched_next = scheduler->head;
+    if (scheduler->head != NULL) {
+        scheduler->head->sched_prev = block;
     }
-    timeout_scheduler.head = block;
+    scheduler->head = block;
 }
 
 static void
-timeout_unschedule_block_unlocked(_PyTimeoutBlock *block)
+timeout_unschedule_block_unlocked(struct _timeout_scheduler_state *scheduler,
+                                  _PyTimeoutBlock *block)
 {
     if (block->sched_prev != NULL) {
         block->sched_prev->sched_next = block->sched_next;
     }
-    else if (timeout_scheduler.head == block) {
-        timeout_scheduler.head = block->sched_next;
+    else if (scheduler->head == block) {
+        scheduler->head = block->sched_next;
     }
     if (block->sched_next != NULL) {
         block->sched_next->sched_prev = block->sched_prev;
@@ -374,6 +365,7 @@ timeout_clear_thread_after_fork_unlocked(PyThreadState *tstate)
 static PyStatus
 timeout_scheduler_after_fork_child(_PyRuntimeState *runtime)
 {
+    struct _timeout_scheduler_state *scheduler = &runtime->timeout_scheduler;
     PyThreadState *current = current_fast_get();
 
     for (PyInterpreterState *interp = runtime->interpreters.head;
@@ -394,8 +386,7 @@ timeout_scheduler_after_fork_child(_PyRuntimeState *runtime)
         ? (_PyTimeoutBlock *)current->timeout_block
         : NULL;
 
-    memset(&timeout_scheduler, 0, sizeof(timeout_scheduler));
-    timeout_scheduler_once = (_PyOnceFlag){0};
+    memset(scheduler, 0, sizeof(*scheduler));
 
     if (block == NULL) {
         return _PyStatus_OK();
@@ -403,39 +394,39 @@ timeout_scheduler_after_fork_child(_PyRuntimeState *runtime)
 
     _Py_unset_eval_breaker_bit(current, _PY_TIMEOUT_EXPIRED_BIT);
 
-    if (PyMUTEX_INIT(&timeout_scheduler.mutex)) {
+    if (PyMUTEX_INIT(&scheduler->mutex)) {
         return _PyStatus_ERR("failed to initialize timeout mutex after fork");
     }
-    if (PyCOND_INIT(&timeout_scheduler.cond)) {
-        (void)PyMUTEX_FINI(&timeout_scheduler.mutex);
+    if (PyCOND_INIT(&scheduler->cond)) {
+        (void)PyMUTEX_FINI(&scheduler->mutex);
         return _PyStatus_ERR("failed to initialize timeout condition after fork");
     }
 
-    timeout_scheduler.initialized = 1;
-    timeout_scheduler.stopping = 0;
-    timeout_scheduler.head = NULL;
+    scheduler->initialized = 1;
+    scheduler->stopping = 0;
+    scheduler->head = NULL;
     for (; block != NULL; block = block->prev) {
         block->tstate = current;
         block->notified = 0;
         block->sched_prev = NULL;
         block->sched_next = NULL;
         if (!block->fired) {
-            timeout_schedule_block_unlocked(block);
+            timeout_schedule_block_unlocked(scheduler, block);
         }
     }
 
-    if (PyThread_start_joinable_thread(timeout_scheduler_thread, NULL,
-                                       &timeout_scheduler.ident,
-                                       &timeout_scheduler.handle))
+    if (PyThread_start_joinable_thread(timeout_scheduler_thread, scheduler,
+                                       &scheduler->ident,
+                                       &scheduler->handle))
     {
-        (void)PyCOND_FINI(&timeout_scheduler.cond);
-        (void)PyMUTEX_FINI(&timeout_scheduler.mutex);
-        memset(&timeout_scheduler, 0, sizeof(timeout_scheduler));
+        (void)PyCOND_FINI(&scheduler->cond);
+        (void)PyMUTEX_FINI(&scheduler->mutex);
+        memset(scheduler, 0, sizeof(*scheduler));
         return _PyStatus_ERR("failed to start timeout scheduler thread after fork");
     }
 
-    timeout_scheduler.running = 1;
-    _Py_atomic_store_uint8(&timeout_scheduler_once.v, _Py_ONCE_INITIALIZED);
+    scheduler->running = 1;
+    _Py_atomic_store_uint8(&scheduler->once.v, _Py_ONCE_INITIALIZED);
     return _PyStatus_OK();
 }
 #endif
@@ -726,7 +717,7 @@ _PyRuntimeState_Fini(_PyRuntimeState *runtime)
     /* The count is cleared by _Py_FinalizeRefTotal(). */
     assert(runtime->object_state.interpreter_leaks == 0);
 #endif
-    timeout_scheduler_fini();
+    timeout_scheduler_fini(&runtime->timeout_scheduler);
     gilstate_clear();
 }
 
@@ -3991,13 +3982,14 @@ int
 _PyTimeout_Push(PyThreadState *tstate, PyTime_t timeout)
 {
     assert(tstate != NULL);
+    struct _timeout_scheduler_state *scheduler = &tstate->interp->runtime->timeout_scheduler;
 
     if (timeout < 0) {
         PyErr_SetString(PyExc_ValueError, "timeout must be non-negative");
         return -1;
     }
-    if (_PyOnceFlag_CallOnce(&timeout_scheduler_once,
-                             timeout_scheduler_init, NULL) < 0)
+    if (_PyOnceFlag_CallOnce(&scheduler->once,
+                             timeout_scheduler_init, scheduler) < 0)
     {
         return -1;
     }
@@ -4018,18 +4010,18 @@ _PyTimeout_Push(PyThreadState *tstate, PyTime_t timeout)
     block->sched_prev = NULL;
     block->sched_next = NULL;
 
-    timeout_mutex_lock();
-    if (timeout_scheduler.stopping) {
-        timeout_mutex_unlock();
+    timeout_mutex_lock(scheduler);
+    if (scheduler->stopping) {
+        timeout_mutex_unlock(scheduler);
         PyMem_RawFree(block);
         PyErr_SetString(PyExc_RuntimeError, "timeout scheduler is shutting down");
         return -1;
     }
     block->prev = (_PyTimeoutBlock *)tstate->timeout_block;
     tstate->timeout_block = (struct _timeout_block *)block;
-    timeout_schedule_block_unlocked(block);
-    timeout_cond_signal();
-    timeout_mutex_unlock();
+    timeout_schedule_block_unlocked(scheduler, block);
+    timeout_cond_signal(scheduler);
+    timeout_mutex_unlock(scheduler);
 
     return 0;
 }
@@ -4038,24 +4030,25 @@ int
 _PyTimeout_Pop(PyThreadState *tstate)
 {
     assert(tstate != NULL);
+    struct _timeout_scheduler_state *scheduler = &tstate->interp->runtime->timeout_scheduler;
 
-    if (!timeout_scheduler.initialized) {
+    if (!scheduler->initialized) {
         PyErr_SetString(PyExc_RuntimeError, "cannot exit inactive timeout");
         return -1;
     }
 
-    timeout_mutex_lock();
+    timeout_mutex_lock(scheduler);
     _PyTimeoutBlock *block = (_PyTimeoutBlock *)tstate->timeout_block;
     if (block == NULL) {
-        timeout_mutex_unlock();
+        timeout_mutex_unlock(scheduler);
         PyErr_SetString(PyExc_RuntimeError, "cannot exit inactive timeout");
         return -1;
     }
 
     tstate->timeout_block = (struct _timeout_block *)block->prev;
-    timeout_unschedule_block_unlocked(block);
-    timeout_cond_signal();
-    timeout_mutex_unlock();
+    timeout_unschedule_block_unlocked(scheduler, block);
+    timeout_cond_signal(scheduler);
+    timeout_mutex_unlock(scheduler);
 
     PyMem_RawFree(block);
     return 0;
@@ -4065,28 +4058,29 @@ int
 _PyTimeout_CheckNow(PyThreadState *tstate)
 {
     assert(tstate != NULL);
+    struct _timeout_scheduler_state *scheduler = &tstate->interp->runtime->timeout_scheduler;
 
-    if (!timeout_scheduler.initialized) {
+    if (!scheduler->initialized) {
         return 0;
     }
 
     PyTime_t now;
     (void)PyTime_MonotonicRaw(&now);
 
-    timeout_mutex_lock();
+    timeout_mutex_lock(scheduler);
     if (tstate->timeout_block == NULL) {
-        timeout_mutex_unlock();
+        timeout_mutex_unlock(scheduler);
         return 0;
     }
 
     _PyTimeoutBlock *expired = timeout_find_expired(tstate, now);
     if (expired == NULL) {
-        timeout_mutex_unlock();
+        timeout_mutex_unlock(scheduler);
         return 0;
     }
 
     expired->fired = 1;
-    timeout_mutex_unlock();
+    timeout_mutex_unlock(scheduler);
     PyErr_SetString(PyExc_TimeoutError, "timeout expired");
     return -1;
 }
@@ -4103,28 +4097,29 @@ void
 _PyTimeout_ClearThread(PyThreadState *tstate)
 {
     assert(tstate != NULL);
+    struct _timeout_scheduler_state *scheduler = &tstate->interp->runtime->timeout_scheduler;
 
-    if (!timeout_scheduler.initialized) {
+    if (!scheduler->initialized) {
         _Py_unset_eval_breaker_bit(tstate, _PY_TIMEOUT_EXPIRED_BIT);
         return;
     }
 
-    timeout_mutex_lock();
+    timeout_mutex_lock(scheduler);
     _PyTimeoutBlock *block = (_PyTimeoutBlock *)tstate->timeout_block;
     if (block == NULL) {
-        timeout_mutex_unlock();
+        timeout_mutex_unlock(scheduler);
         _Py_unset_eval_breaker_bit(tstate, _PY_TIMEOUT_EXPIRED_BIT);
         return;
     }
     tstate->timeout_block = NULL;
     while (block != NULL) {
         _PyTimeoutBlock *prev = block->prev;
-        timeout_unschedule_block_unlocked(block);
+        timeout_unschedule_block_unlocked(scheduler, block);
         PyMem_RawFree(block);
         block = prev;
     }
-    timeout_cond_signal();
-    timeout_mutex_unlock();
+    timeout_cond_signal(scheduler);
+    timeout_mutex_unlock(scheduler);
 
     _Py_unset_eval_breaker_bit(tstate, _PY_TIMEOUT_EXPIRED_BIT);
 }
