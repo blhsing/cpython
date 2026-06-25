@@ -554,7 +554,7 @@ typedef struct {
             if (PyErr_CheckSignals()) {                            \
                 RETURN_ERROR(SRE_ERROR_INTERRUPTED);               \
             }                                                      \
-            if (_PyTimeout_CheckNow(_PyThreadState_GET())) {       \
+            if (_PyThreadState_CheckCancellation(_PyThreadState_GET())) { \
                 RETURN_ERROR(SRE_ERROR_INTERRUPTED);               \
             }                                                      \
         }                                                          \

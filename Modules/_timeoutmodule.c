@@ -38,7 +38,7 @@ static PyObject *
 timeout_check(PyObject *Py_UNUSED(module), PyObject *Py_UNUSED(ignored))
 {
     PyThreadState *tstate = _PyThreadState_GET();
-    if (_PyTimeout_CheckNow(tstate) < 0) {
+    if (_PyThreadState_CheckCancellation(tstate) < 0) {
         return NULL;
     }
 
@@ -46,10 +46,32 @@ timeout_check(PyObject *Py_UNUSED(module), PyObject *Py_UNUSED(ignored))
 }
 
 
+static PyObject *
+timeout_cancel(PyObject *Py_UNUSED(module), PyObject *args)
+{
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (PyTuple_GET_SIZE(args) == 0) {
+        _PyThreadState_RequestCancel(tstate, _PY_CANCEL_GENERIC);
+        Py_RETURN_NONE;
+    }
+
+    unsigned long id;
+    if (!PyArg_ParseTuple(args, "k:cancel", &id)) {
+        return NULL;
+    }
+
+    int requested = _PyThreadState_RequestCancelByThreadId(
+        tstate->interp, id, _PY_CANCEL_GENERIC);
+    return PyLong_FromLong(requested);
+}
+
+
 static PyMethodDef timeout_methods[] = {
     {"enter", timeout_enter, METH_O, PyDoc_STR("Enter a timeout block.")},
     {"leave", timeout_leave, METH_NOARGS, PyDoc_STR("Leave a timeout block.")},
-    {"check", timeout_check, METH_NOARGS, PyDoc_STR("Check the current timeout.")},
+    {"check", timeout_check, METH_NOARGS, PyDoc_STR("Check for cancellation.")},
+    {"cancel", timeout_cancel, METH_VARARGS,
+        PyDoc_STR("Request cooperative cancellation.")},
     {NULL, NULL}
 };
 

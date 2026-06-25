@@ -1646,11 +1646,57 @@ class TestTimeout(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             _timeout.leave()
 
+    def test_direct_cancel_current_thread(self):
+        with self.assertRaisesRegex(RuntimeError, "thread cancelled"):
+            _timeout.cancel()
+            _timeout.check()
+
+    def test_direct_cancel_current_thread_at_eval_breaker(self):
+        with self.assertRaisesRegex(RuntimeError, "thread cancelled"):
+            _timeout.cancel()
+            pass
+
+    def test_cancel_unknown_thread(self):
+        self.assertEqual(_timeout.cancel(0), 0)
+
+    def test_cancel_thread_by_ident(self):
+        ready = threading.Event()
+        stop = threading.Event()
+        result = []
+
+        def worker():
+            ready.set()
+            try:
+                while not stop.is_set():
+                    pass
+            except RuntimeError as exc:
+                result.append(str(exc))
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        self.addCleanup(thread.join, support.SHORT_TIMEOUT)
+        self.addCleanup(stop.set)
+
+        self.assertTrue(ready.wait(support.SHORT_TIMEOUT))
+        self.assertEqual(_timeout.cancel(thread.ident), 1)
+        thread.join(support.SHORT_TIMEOUT)
+        if thread.is_alive():
+            stop.set()
+            thread.join(support.SHORT_TIMEOUT)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, ["thread cancelled"])
+
     def test_timeout_expires_in_pure_python(self):
         with self.assertRaises(TimeoutError):
             with timeout(0.01):
                 while True:
                     pass
+
+    def test_direct_check_expired_timeout(self):
+        with self.assertRaises(TimeoutError):
+            with timeout(0):
+                _timeout.check()
 
     def test_finally_runs_after_timeout(self):
         state = []
@@ -1671,6 +1717,13 @@ class TestTimeout(unittest.TestCase):
                 with timeout(support.SHORT_TIMEOUT):
                     while True:
                         pass
+
+    def test_sre_checks_timeout_cancellation(self):
+        import re
+
+        with self.assertRaises(TimeoutError):
+            with timeout(0.01):
+                re.fullmatch(r"(a+)+\Z", "a" * 100_000 + "!")
 
     def test_thread_clear_removes_active_timeout(self):
         code = textwrap.dedent("""

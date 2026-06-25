@@ -256,6 +256,7 @@ struct _ts {
         PyInterpreterGuard *owned_guard;
     } ensure;
 
+    uintptr_t cancel_flags;
     struct _timeout_block *timeout_block;
 };
 

@@ -3,8 +3,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext, timeout
-import _timeout
+from contextlib import timeout
 import pyperf
 
 
@@ -58,36 +57,12 @@ def bench_loop_timeout_active(
     return dt
 
 
-def bench_nullcontext_enter_exit(loops: int) -> float:
-    t0 = pyperf.perf_counter()
-    for _ in range(loops):
-        with nullcontext():
-            pass
-    return pyperf.perf_counter() - t0
-
-
 def bench_timeout_enter_exit(loops: int, timeout_seconds: float) -> float:
     _warm_timeout_scheduler(timeout_seconds)
     t0 = pyperf.perf_counter()
     for _ in range(loops):
         with timeout(timeout_seconds):
             pass
-    return pyperf.perf_counter() - t0
-
-
-def bench_check_no_timeout(loops: int) -> float:
-    t0 = pyperf.perf_counter()
-    for _ in range(loops):
-        _timeout.check()
-    return pyperf.perf_counter() - t0
-
-
-def bench_check_timeout_active(loops: int, timeout_seconds: float) -> float:
-    _warm_timeout_scheduler(timeout_seconds)
-    t0 = pyperf.perf_counter()
-    with timeout(timeout_seconds):
-        for _ in range(loops):
-            _timeout.check()
     return pyperf.perf_counter() - t0
 
 
@@ -155,21 +130,8 @@ def main() -> None:
         args.timeout_seconds,
     )
     runner.bench_time_func(
-        "nullcontext_enter_exit",
-        bench_nullcontext_enter_exit,
-    )
-    runner.bench_time_func(
         "timeout_enter_exit",
         bench_timeout_enter_exit,
-        args.timeout_seconds,
-    )
-    runner.bench_time_func(
-        "_timeout_check_no_timeout",
-        bench_check_no_timeout,
-    )
-    runner.bench_time_func(
-        "_timeout_check_active",
-        bench_check_timeout_active,
         args.timeout_seconds,
     )
     if args.expiry:

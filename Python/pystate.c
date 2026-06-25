@@ -152,7 +152,7 @@ timeout_notify_expired_unlocked(struct _timeout_scheduler_state *scheduler,
     {
         if (!block->notified && block->deadline <= now) {
             block->notified = 1;
-            _Py_set_eval_breaker_bit(block->tstate, _PY_TIMEOUT_EXPIRED_BIT);
+            _PyThreadState_RequestCancel(block->tstate, _PY_CANCEL_TIMEOUT);
         }
     }
 }
@@ -359,7 +359,7 @@ timeout_clear_thread_after_fork_unlocked(PyThreadState *tstate)
         PyMem_RawFree(block);
         block = prev;
     }
-    _Py_unset_eval_breaker_bit(tstate, _PY_TIMEOUT_EXPIRED_BIT);
+    _PyThreadState_ClearCancellation(tstate, _PY_CANCEL_TIMEOUT);
 }
 
 static PyStatus
@@ -392,7 +392,7 @@ timeout_scheduler_after_fork_child(_PyRuntimeState *runtime)
         return _PyStatus_OK();
     }
 
-    _Py_unset_eval_breaker_bit(current, _PY_TIMEOUT_EXPIRED_BIT);
+    _PyThreadState_ClearCancellation(current, _PY_CANCEL_TIMEOUT);
 
     if (PyMUTEX_INIT(&scheduler->mutex)) {
         return _PyStatus_ERR("failed to initialize timeout mutex after fork");
@@ -1947,6 +1947,7 @@ init_threadstate(_PyThreadStateImpl *_tstate,
     tstate->current_executor = NULL;
     tstate->jit_exit = NULL;
     tstate->dict_global_version = 0;
+    tstate->cancel_flags = 0;
     tstate->timeout_block = NULL;
 
     _tstate->c_stack_soft_limit = UINTPTR_MAX;
@@ -4086,11 +4087,58 @@ _PyTimeout_CheckNow(PyThreadState *tstate)
 }
 
 int
-_PyTimeout_HandleExpired(PyThreadState *tstate)
+_PyThreadState_CheckCancellation(PyThreadState *tstate)
 {
     assert(tstate != NULL);
-    _Py_unset_eval_breaker_bit(tstate, _PY_TIMEOUT_EXPIRED_BIT);
+    _Py_unset_eval_breaker_bit(tstate, _PY_CANCEL_REQUESTED_BIT);
+    uintptr_t cancel_flags = _Py_atomic_exchange_uintptr(
+        &tstate->cancel_flags, 0);
+    if ((cancel_flags & _PY_CANCEL_TIMEOUT) != 0) {
+        if (_PyTimeout_CheckNow(tstate) < 0) {
+            if ((cancel_flags & _PY_CANCEL_GENERIC) != 0) {
+                _PyThreadState_RequestCancel(tstate, _PY_CANCEL_GENERIC);
+            }
+            return -1;
+        }
+    }
+    if ((cancel_flags & _PY_CANCEL_GENERIC) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "thread cancelled");
+        return -1;
+    }
     return _PyTimeout_CheckNow(tstate);
+}
+
+void
+_PyThreadState_RequestCancel(PyThreadState *tstate, uintptr_t reason)
+{
+    assert(tstate != NULL);
+    _Py_atomic_or_uintptr(&tstate->cancel_flags, reason);
+    _Py_set_eval_breaker_bit(tstate, _PY_CANCEL_REQUESTED_BIT);
+}
+
+int
+_PyThreadState_RequestCancelByThreadId(PyInterpreterState *interp,
+                                       unsigned long id,
+                                       uintptr_t reason)
+{
+    int requested = 0;
+    _Py_FOR_EACH_TSTATE_BEGIN(interp, t) {
+        if (t->thread_id == id) {
+            _PyThreadState_RequestCancel(t, reason);
+            requested = 1;
+            break;
+        }
+    }
+    _Py_FOR_EACH_TSTATE_END(interp);
+
+    return requested;
+}
+
+void
+_PyThreadState_ClearCancellation(PyThreadState *tstate, uintptr_t reason)
+{
+    assert(tstate != NULL);
+    _Py_atomic_and_uintptr(&tstate->cancel_flags, ~reason);
 }
 
 void
@@ -4100,7 +4148,7 @@ _PyTimeout_ClearThread(PyThreadState *tstate)
     struct _timeout_scheduler_state *scheduler = &tstate->interp->runtime->timeout_scheduler;
 
     if (!scheduler->initialized) {
-        _Py_unset_eval_breaker_bit(tstate, _PY_TIMEOUT_EXPIRED_BIT);
+        _PyThreadState_ClearCancellation(tstate, _PY_CANCEL_TIMEOUT);
         return;
     }
 
@@ -4108,7 +4156,7 @@ _PyTimeout_ClearThread(PyThreadState *tstate)
     _PyTimeoutBlock *block = (_PyTimeoutBlock *)tstate->timeout_block;
     if (block == NULL) {
         timeout_mutex_unlock(scheduler);
-        _Py_unset_eval_breaker_bit(tstate, _PY_TIMEOUT_EXPIRED_BIT);
+        _PyThreadState_ClearCancellation(tstate, _PY_CANCEL_TIMEOUT);
         return;
     }
     tstate->timeout_block = NULL;
@@ -4121,5 +4169,5 @@ _PyTimeout_ClearThread(PyThreadState *tstate)
     timeout_cond_signal(scheduler);
     timeout_mutex_unlock(scheduler);
 
-    _Py_unset_eval_breaker_bit(tstate, _PY_TIMEOUT_EXPIRED_BIT);
+    _PyThreadState_ClearCancellation(tstate, _PY_CANCEL_TIMEOUT);
 }
