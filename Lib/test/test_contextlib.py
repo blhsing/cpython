@@ -1698,6 +1698,9 @@ class TestTimeout(unittest.TestCase):
             with timeout(0):
                 _timeout.check()
 
+        with self.assertRaises(RuntimeError):
+            _timeout.leave()
+
     def test_finally_runs_after_timeout(self):
         state = []
 

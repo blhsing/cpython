@@ -114,7 +114,7 @@ timeout_find_next_deadline_unlocked(struct _timeout_scheduler_state *scheduler,
          block != NULL;
          block = block->sched_next)
     {
-        if (block->notified) {
+        if (block->notified || block->fired) {
             continue;
         }
         if (!found || block->deadline < earliest) {
@@ -150,7 +150,7 @@ timeout_notify_expired_unlocked(struct _timeout_scheduler_state *scheduler,
          block != NULL;
          block = block->sched_next)
     {
-        if (!block->notified && block->deadline <= now) {
+        if (!block->notified && !block->fired && block->deadline <= now) {
             block->notified = 1;
             _PyThreadState_RequestCancel(block->tstate, _PY_CANCEL_TIMEOUT);
         }
@@ -4081,6 +4081,8 @@ _PyTimeout_CheckNow(PyThreadState *tstate)
     }
 
     expired->fired = 1;
+    expired->notified = 1;
+    timeout_cond_signal(scheduler);
     timeout_mutex_unlock(scheduler);
     PyErr_SetString(PyExc_TimeoutError, "timeout expired");
     return -1;
