@@ -8,7 +8,9 @@ extern "C" {
 #endif
 
 #include "pycore_interp_structs.h" // _PyGC_Head_UNUSED
+#include "pycore_condvar.h"       // PyCOND_T
 #include "pycore_obmalloc.h"      // struct _obmalloc_global_state
+#include "pycore_pythread.h"      // PyThread_handle_t
 
 /************ Runtime state ************/
 
@@ -85,6 +87,20 @@ struct _Py_time_runtime_state {
 #else
     char _unused;
 #endif
+};
+
+struct _timeout_block;
+
+struct _timeout_scheduler_state {
+    PyMUTEX_T mutex;
+    PyCOND_T cond;
+    PyThread_ident_t ident;
+    PyThread_handle_t handle;
+    int initialized;
+    int running;
+    int stopping;
+    struct _timeout_block *head;
+    _PyOnceFlag once;
 };
 
 
@@ -270,6 +286,7 @@ struct pyruntimestate {
     struct _Py_unicode_runtime_state unicode_state;
     struct _types_runtime_state types;
     struct _Py_time_runtime_state time;
+    struct _timeout_scheduler_state timeout_scheduler;
 
 #if defined(__EMSCRIPTEN__) && defined(PY_CALL_TRAMPOLINE)
     // Used in "Python/emscripten_trampoline.c" to choose between wasm-gc

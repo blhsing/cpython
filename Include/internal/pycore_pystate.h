@@ -171,6 +171,23 @@ extern void _PyEval_StartTheWorldAll(_PyRuntimeState *runtime);
 extern PyAPI_FUNC(void) _PyEval_StopTheWorld(PyInterpreterState *interp);
 extern PyAPI_FUNC(void) _PyEval_StartTheWorld(PyInterpreterState *interp);
 
+#define _PY_CANCEL_GENERIC (1U << 0)
+#define _PY_CANCEL_TIMEOUT (1U << 1)
+
+extern void _PyThreadState_RequestCancel(PyThreadState *tstate,
+                                         uintptr_t reason);
+extern int _PyThreadState_RequestCancelByThreadId(PyInterpreterState *interp,
+                                                  unsigned long id,
+                                                  uintptr_t reason);
+extern int _PyThreadState_CheckCancellation(PyThreadState *tstate);
+extern void _PyThreadState_ClearCancellation(PyThreadState *tstate,
+                                             uintptr_t reason);
+
+extern int _PyTimeout_Push(PyThreadState *tstate, PyTime_t timeout);
+extern int _PyTimeout_Pop(PyThreadState *tstate);
+extern int _PyTimeout_CheckNow(PyThreadState *tstate);
+extern void _PyTimeout_ClearThread(PyThreadState *tstate);
+
 
 static inline void
 _Py_EnsureFuncTstateNotNULL(const char *func, PyThreadState *tstate)

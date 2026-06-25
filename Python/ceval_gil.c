@@ -5,6 +5,7 @@
 #include "pycore_optimizer.h"     // _Py_Executors_InvalidateCold()
 #include "pycore_pyerrors.h"      // _PyErr_GetRaisedException()
 #include "pycore_pylifecycle.h"   // _PyErr_Print()
+#include "pycore_pystate.h"       // _PyThreadState_CheckCancellation()
 #include "pycore_pystats.h"       // _Py_PrintSpecializationStats()
 #include "pycore_runtime.h"       // _PyRuntime
 
@@ -1424,6 +1425,12 @@ _Py_HandlePending(PyThreadState *tstate)
     /* Check for asynchronous exception. */
     if ((breaker & _PY_ASYNC_EXCEPTION_BIT) != 0) {
         if (_PyEval_RaiseAsyncExc(tstate) < 0) {
+            return -1;
+        }
+    }
+
+    if ((breaker & _PY_CANCEL_REQUESTED_BIT) != 0) {
+        if (_PyThreadState_CheckCancellation(tstate) < 0) {
             return -1;
         }
     }

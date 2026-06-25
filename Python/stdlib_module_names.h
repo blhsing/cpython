@@ -93,6 +93,7 @@ static const char* _Py_stdlib_module_names[] = {
 "_sysconfig",
 "_thread",
 "_threading_local",
+"_timeout",
 "_tkinter",
 "_tokenize",
 "_tracemalloc",

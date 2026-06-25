@@ -429,6 +429,35 @@ class EmbeddingTests(EmbeddingTestsMixin, unittest.TestCase):
         out, err = self.run_embedded_interpreter("test_repeated_init_exec", code)
         self.assertEqual(out, 'Tests passed\n' * INIT_LOOPS)
 
+    def test_timeout_repeated_init(self):
+        code = textwrap.dedent("""
+            from contextlib import timeout
+
+            with timeout(1.0):
+                pass
+            try:
+                with timeout(0.01):
+                    while True:
+                        pass
+            except TimeoutError:
+                pass
+            else:
+                raise AssertionError("timeout did not fire")
+            print("timeout-cycle")
+        """)
+        out, err = self.run_embedded_interpreter("test_repeated_init_exec", code)
+        self.assertEqual(out, 'timeout-cycle\n' * INIT_LOOPS)
+
+    def test_timeout_active_block_cleared_at_finalize(self):
+        code = textwrap.dedent("""
+            import _timeout
+
+            _timeout.enter(3600)
+            print("active-timeout-cycle")
+        """)
+        out, err = self.run_embedded_interpreter("test_repeated_init_exec", code)
+        self.assertEqual(out, 'active-timeout-cycle\n' * INIT_LOOPS)
+
     def test_simple_initialization_api(self):
         # _testembed now uses Py_InitializeFromConfig by default
         # This case specifically checks Py_Initialize(Ex) still works
